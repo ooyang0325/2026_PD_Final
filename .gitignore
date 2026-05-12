@@ -3,3 +3,5 @@
 *.csv
 *.cfg
 *.in
+*.DS_Store
+*.log
