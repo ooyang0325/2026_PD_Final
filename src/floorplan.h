@@ -17,7 +17,7 @@ public:
     std::vector<int> ft_nets;
     std::vector<int> active_loc;
 
-    // Cached: indices of edge blocks (constant after construction)
+    // Cache the indices of edge blocks to avoid repeated checks inside the SA loop
     std::vector<int> edge_block_idx;
 
     Floorplan(Design& d_) : d(d_), sp((int)d_.blocks.size()),
@@ -41,7 +41,6 @@ public:
         active_loc[i] = (active_loc[i] + 1) % nlocs;
     }
 
-    // Update soft block dimensions based on estimated feedthrough nets.
     void apply_ft_areas(bool reset_zero = true) {
         for (int i = 0; i < (int)d.blocks.size(); i++) {
             if (d.blocks[i].type != BlockType::SOFT) continue;
@@ -70,32 +69,37 @@ public:
         }
     }
 
-    // Fast eval for SA inner loop: updates sp.x/sp.y, returns (tw, th).
-    // Does NOT touch d.blocks (caller can read sp.x/sp.y/W/H directly).
+    // High-frequency call inside SA: only evaluate positions without writing back to d.blocks
     std::pair<double,double> eval() {
         return sp.evaluate(W, H);
     }
 
-    // Eval + write back to d.blocks. Use outside SA hot loop (routing, output).
+    // Used for final packing: evaluate, force edge blocks to snap to the boundary, and write coordinates back to d.blocks
     std::pair<double,double> pack() {
         auto [tw, th] = sp.evaluate(W, H);
-        commit();
-        return {tw, th};
-    }
-
-    // Write sp.x/sp.y/W/H into d.blocks so external code (routing,
-    // ChannelCalculator, output) sees current state.
-    void commit() {
+        
         for (int i = 0; i < (int)d.blocks.size(); i++) {
             d.blocks[i].lx = sp.x[i];
             d.blocks[i].ly = sp.y[i];
             d.blocks[i].width  = W[i];
             d.blocks[i].height = H[i];
         }
+
+        // Force edge blocks to the boundary
+        for (int i : edge_block_idx) {
+            auto& b = d.blocks[i];
+            int li = std::min(active_loc[i], (int)b.locations.size() - 1);
+            const std::string& loc = b.locations[li];
+            
+            if (loc.find('T') != std::string::npos) b.ly = th - b.height;
+            if (loc.find('B') != std::string::npos) b.ly = 0.0;
+            if (loc.find('L') != std::string::npos) b.lx = 0.0;
+            if (loc.find('R') != std::string::npos) b.lx = tw - b.width;
+        }
+
+        return {tw, th};
     }
 
-    // HPWL on block centers, reading directly from sp.x/sp.y/W/H (not d.blocks).
-    // This decouples cost eval from d.blocks staleness during SA.
     double compute_hpwl() const {
         double total = 0;
         const auto& spx = sp.x;
@@ -120,30 +124,56 @@ public:
         if (chip_w > max_w) cost += 1e8 * (chip_w - max_w);
         if (chip_h > max_h) cost += 1e8 * (chip_h - max_h);
 
+        // Add boundary and overlap penalties
         cost += edge_block_penalty(chip_w, chip_h);
         return cost;
     }
 
-    // Edge block location penalty, reading from sp.x/sp.y/W/H.
-    // Iterates only over cached edge block indices.
+    // Virtual snapping and collision testing (Virtual Snapping & Overlap Penalty)
     double edge_block_penalty(double chip_w, double chip_h) const {
         double penalty = 0;
-        const double W_PENALTY = 1e6;
+        const double OVERLAP_W = 1e6; // Very high penalty for overlap
+        const double DIST_W = 1e1;    // Mild distance penalty to guide the SP toward the target
+
+        int n = d.blocks.size();
+        
+        // Use static arrays to avoid memory allocation inside the SA hot loop (problem guarantees BLOCK < 50)
+        double sx[256];
+        double sy[256];
+        for (int i = 0; i < n && i < 256; i++) {
+            sx[i] = sp.x[i];
+            sy[i] = sp.y[i];
+        }
+
+        // 1. Precompute the virtual snapped coordinates for each edge block
         for (int i : edge_block_idx) {
-            const auto& b = d.blocks[i];
-            int li = std::min(active_loc[i], (int)b.locations.size() - 1);
-            const std::string& loc = b.locations[li];
-            char side = loc[0];
-            double lx = sp.x[i], ly = sp.y[i];
-            double w = W[i], h = H[i];
-            if (side == 'T') {
-                penalty += W_PENALTY * std::abs((ly + h) - chip_h);
-            } else if (side == 'B') {
-                penalty += W_PENALTY * std::abs(ly);
-            } else if (side == 'L') {
-                penalty += W_PENALTY * std::abs(lx);
-            } else if (side == 'R') {
-                penalty += W_PENALTY * std::abs((lx + w) - chip_w);
+            int li = std::min(active_loc[i], (int)d.blocks[i].locations.size() - 1);
+            const std::string& loc = d.blocks[i].locations[li];
+            
+            // Strictly test each character so TL satisfies both T and L
+            if (loc.find('T') != std::string::npos) sy[i] = chip_h - H[i];
+            if (loc.find('B') != std::string::npos) sy[i] = 0.0;
+            if (loc.find('L') != std::string::npos) sx[i] = 0.0;
+            if (loc.find('R') != std::string::npos) sx[i] = chip_w - W[i];
+
+            // Add a small pulling penalty to encourage SA to place it near the target position and keep the topology reasonable
+            penalty += DIST_W * (std::abs(sx[i] - sp.x[i]) + std::abs(sy[i] - sp.y[i]));
+        }
+
+        // 2. Perform O(N^2) collision detection on the virtual snapped coordinates
+        for (int i : edge_block_idx) {
+            for (int j = 0; j < n; j++) {
+                if (i == j) continue;
+                // Prevent double counting between two edge blocks
+                if (d.blocks[j].type == BlockType::EDGE && i >= j) continue;
+
+                double ox = std::min(sx[i] + W[i], sx[j] + W[j]) - std::max(sx[i], sx[j]);
+                double oy = std::min(sy[i] + H[i], sy[j] + H[j]) - std::max(sy[i], sy[j]);
+                
+                // If overlap occurs after virtual snapping, give a destructive penalty
+                if (ox > 1e-6 && oy > 1e-6) {
+                    penalty += OVERLAP_W * (ox * oy);
+                }
             }
         }
         return penalty;
