@@ -67,8 +67,8 @@ public:
     // Print summary to stderr
     static void print_summary(const Design& d) {
         double area = d.outline.cur_width * d.outline.cur_height;
-        // 將 HPWL 與 Cost 計算交給外部一致的邏輯或在此重新呼叫 get_guiding_point
-        // 為了簡潔，印出 Overflow 的詳細狀況
+        // Delegate HPWL and cost calculation to external consistent logic or re-call get_guiding_point here
+        // For brevity, print overflow details
         std::cerr << "=== Summary ===\n"
                   << "Outline: " << fmt(d.outline.cur_width) << " x " << fmt(d.outline.cur_height) << "\n"
                   << "Area: " << fmt(area) << "\n";

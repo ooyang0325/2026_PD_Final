@@ -89,31 +89,37 @@ public:
                     case 2: fp.sp.swap_gm(bi, bj); changed = true; break;
                     case 3: fp.sp.swap_both(bi, bj); changed = true; break;
                     case 4: {
-                        // Rotate soft block (swap W/H if AR stays in range)
+                        // Rotate: swap W and H when the aspect ratio is within allowed limits
                         if (fp.d.blocks[bi].type == BlockType::SOFT) {
+                            double target_area = fp.d.blocks[bi].get_target_area(fp.ft_nets[bi]);
                             double new_w = fp.H[bi], new_h = fp.W[bi];
                             double ar = (new_h > 0) ? new_w / new_h : 1.0;
                             double mn = fp.d.blocks[bi].min_ar;
                             double mx = fp.d.blocks[bi].max_ar;
                             if (ar >= mn - 1e-6 && ar <= mx + 1e-6) {
                                 saved_W = fp.W[bi]; saved_H = fp.H[bi];
-                                fp.W[bi] = new_w; fp.H[bi] = new_h;
+                                // Round up to two decimal places
+                                fp.W[bi] = std::ceil(new_w * 100.0) / 100.0;
+                                fp.H[bi] = std::ceil((target_area / fp.W[bi]) * 100.0) / 100.0;
                                 changed = true;
                             }
                         }
                         break;
                     }
                     case 5: {
-                        // Resize soft block: pick new AR within bounds, preserve area
+                        // Resize
                         if (fp.d.blocks[bi].type == BlockType::SOFT) {
-                            double area_i = fp.W[bi] * fp.H[bi];
+                            double target_area = fp.d.blocks[bi].get_target_area(fp.ft_nets[bi]);
                             double mn = fp.d.blocks[bi].min_ar;
                             double mx = fp.d.blocks[bi].max_ar;
                             std::uniform_real_distribution<double> ar_dist(mn, mx);
                             double new_ar = ar_dist(rng);
+                            
                             saved_W = fp.W[bi]; saved_H = fp.H[bi];
-                            fp.W[bi] = std::sqrt(area_i * new_ar);
-                            fp.H[bi] = area_i / fp.W[bi];
+                            double raw_w = std::sqrt(target_area * new_ar);
+                            // Round up to two decimal places
+                            fp.W[bi] = std::ceil(raw_w * 100.0) / 100.0;
+                            fp.H[bi] = std::ceil((target_area / fp.W[bi]) * 100.0) / 100.0;
                             changed = true;
                         }
                         break;

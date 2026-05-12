@@ -127,7 +127,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
             }
         }
     }
-    fp.apply_ft_areas(/*reset_zero=*/false);
+    fp.apply_ft_areas();
     auto [tw3, th3] = fp.pack();
     d.outline.cur_width = tw3;
     d.outline.cur_height = th3;

@@ -25,17 +25,14 @@ struct Block {
 
     double get_ar() const { return (height > 0) ? width / height : 1.0; }
 
-    void apply_ft(int ft_nets, double base_area) {
+    // Get the target area after considering FT expansion
+    double get_target_area(int ft_nets) const {
+        if (ft_nets <= 0) return area;
         double rate = ft_conversion_rate(ft_nets);
-        double base_side = std::sqrt(base_area);
+        double base_side = std::sqrt(area);
         double extend = ((double)ft_nets / 25.0) * rate / 2.0;
         double new_side = base_side + extend;
-        double target_area = new_side * new_side;
-        
-        // 使用無條件進位到小數點後兩位，保證截斷後面積不會縮水
-        width = std::ceil(new_side * 100.0) / 100.0;
-        height = std::ceil((target_area / width) * 100.0) / 100.0;
-        area = width * height;
+        return new_side * new_side;
     }
 
     double ft_conversion_rate(int ft_nets) const {
@@ -50,11 +47,12 @@ struct Channel {
     std::string name;
     double lx, ly, width, height;
     
+    int net_count = 0; 
     double nets_x = 0; 
     double nets_y = 0;
 
-    double cap_x() const { return height * 25.0; } // 水平跨越容量
-    double cap_y() const { return width * 25.0; }  // 垂直跨越容量
+    double cap_x() const { return height * 25.0; } 
+    double cap_y() const { return width * 25.0; }  
 
     bool overflowed() const { return nets_x > cap_x() || nets_y > cap_y(); }
 };

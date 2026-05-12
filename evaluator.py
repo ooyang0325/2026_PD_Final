@@ -160,7 +160,7 @@ class Evaluator:
     def evaluate(self):
         print("========== ICCAD 2026 Problem E 評測 ==========")
         
-        # 1. 檢查 Outline constraint violation
+        # 1. Check outline constraint violation
         if self.out_outline[0] > self.max_outline[0] + 1e-3 or self.out_outline[1] > self.max_outline[1] + 1e-3:
             print(f"[FAIL] Outline constraint violation! 配置超出了 MAX: {self.max_outline}")
             self.fails += 1
@@ -170,7 +170,7 @@ class Evaluator:
                 print(f"[FAIL] Outline constraint violation! Block {name} 跑出邊界。")
                 self.fails += 1
 
-        # 2. 檢查 Block overlap
+        # 2. Check block overlap
         b_items = list(self.blocks.items())
         for i in range(len(b_items)):
             n1, b1 = b_items[i]
@@ -182,14 +182,14 @@ class Evaluator:
                     print(f"[FAIL] Block overlap! {n1} 與 {n2} 發生重疊，重疊面積: {x_over*y_over:.2f}")
                     self.fails += 1
 
-        # 3. 檢查 Edge Block Constraints
+        # 3. Check edge block constraints
         for name, b in self.blocks.items():
             if self.blocks_info[name]["type"] == "EDGE":
                 if not self.check_edge_location(name, b):
                     print(f"[FAIL] Edge constraint violation! {name} 未能放置在要求的邊界 {self.blocks_info[name]['loc']}")
                     self.fails += 1
 
-        # 4. 解析 PATH、檢查 Routing Open 與 計算精確 HPWL
+        # 4. Parse PATH, check routing open, and compute exact HPWL
         total_hpwl = 0
         ft_block_nets = {b: 0 for b in self.blocks if self.blocks_info[b]["type"] == "SOFT"}
         routed_matrix = {}
@@ -210,11 +210,11 @@ class Evaluator:
                 r2 = r_info[i+1]["name"]
                 e2 = r_info[i+1]["in"]
                 
-                # 計算 Guiding point
+                # Compute guiding point
                 gp = self.get_guiding_point(r1, e1, r2, e2)
                 guiding_points.append(gp)
                 
-                # 若中間節點是 Channel，判定並累加方向流量
+                # If the intermediate node is a channel, determine and accumulate directional flow
                 if i > 0 and r1.startswith("CH"):
                     in_dir = r_info[i]["in"]
                     out_dir = r_info[i]["out"]
@@ -223,11 +223,11 @@ class Evaluator:
                     if has_x: self.channels[r1]["nets_x"] += nets
                     if has_y: self.channels[r1]["nets_y"] += nets
                     
-                # 若中間節點是 Soft Block，累加 FT
+                # If the intermediate node is a soft block, accumulate FT
                 if i > 0 and r1.startswith("BLK") and self.blocks_info[r1]["type"] == "SOFT":
                     ft_block_nets[r1] += nets
             
-            # 精確計算各段曼哈頓距離總和
+            # Compute the exact total Manhattan distance across segments
             length = 0
             for k in range(len(guiding_points) - 1):
                 pt1 = guiding_points[k]
@@ -235,14 +235,14 @@ class Evaluator:
                 length += abs(pt1[0] - pt2[0]) + abs(pt1[1] - pt2[1])
             total_hpwl += length * nets
 
-        # 5. 檢查 Routing open
+        # 5. Check routing open
         for pair, req_nets in self.conn_matrix.items():
             act_nets = routed_matrix.get(pair, 0)
             if act_nets < req_nets:
                 print(f"[FAIL] Routing open! Net {pair[0]}-{pair[1]} 需求 {req_nets}，實際只繞了 {act_nets}")
                 self.fails += 1
 
-        # 6. 檢查 Channel overflow (Penalty)
+        # 6. Check channel overflow (Penalty)
         for ch, data in self.channels.items():
             cap_x = data["h"] * 25.0  # 水平穿越看高度
             cap_y = data["w"] * 25.0  # 垂直穿越看寬度
@@ -253,7 +253,7 @@ class Evaluator:
                 print(f"[PENALTY] Channel overflow! {ch} 垂直流量 {data['nets_y']} > 容量 {cap_y:.1f}")
                 self.penalties += 1
 
-        # 7. 檢查 Feedthrough overflow (Penalty)
+        # 7. Check feedthrough overflow (Penalty)
         for blk, ftnets in ft_block_nets.items():
             rates = self.blocks_info[blk]["ft_rates"]
             if ftnets <= 3000: rate = rates[0]
