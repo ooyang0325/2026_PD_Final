@@ -8,6 +8,9 @@
 #include <iostream>
 #include <string>
 #include <chrono>
+#include <future>
+#include <thread>
+#include <vector>
 
 // Derive a representative point for HPWL based on edge adjacency.
 static std::pair<double, double> get_guiding_point(
@@ -143,6 +146,54 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
     return cost;
 }
 
+static unsigned mix_seed(unsigned base, unsigned idx) {
+    // Simple mix to derive distinct seeds per worker/restart.
+    uint64_t x = (uint64_t)base + 0x9e3779b97f4a7c15ULL * (uint64_t)(idx + 1);
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return (unsigned)(x & 0xffffffffu);
+}
+
+static std::pair<double, Design> run_search(const Design& d,
+                                            double time_limit,
+                                            unsigned seed_base) {
+    auto t0 = std::chrono::steady_clock::now();
+    auto elapsed = [&]() {
+        return std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+    };
+
+    double total_budget = time_limit * 0.95;
+    const double min_restart = 10.0;
+
+    Design best_d = d;
+    double best_cost = 1e18;
+    int restart = 0;
+
+    while (elapsed() < total_budget) {
+        double remaining = total_budget - elapsed();
+        if (remaining < min_restart) break;
+
+        double sa1_t = remaining * 0.75;
+        double sa2_t = remaining * 0.20;
+
+        unsigned seed1 = mix_seed(seed_base, (unsigned)(restart * 2));
+        unsigned seed2 = mix_seed(seed_base, (unsigned)(restart * 2 + 1));
+
+        Design trial = d;
+        double cost = run_once(trial, sa1_t, sa2_t, seed1, seed2);
+
+        if (cost < best_cost) {
+            best_cost = cost;
+            best_d = trial;
+        }
+        restart++;
+    }
+
+    return {best_cost, best_d};
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <input.csv> <output.cfg> [time_limit_sec]\n";
@@ -169,40 +220,28 @@ int main(int argc, char* argv[]) {
               << "  Outline max: " << d.outline.max_width << " x " << d.outline.max_height << "\n"
               << "  alpha = " << d.alpha << "\n";
 
-    // Each restart: 75% coarse SA, 20% fine SA, rest for routing overhead.
-    // Multiple restarts if time permits; minimum restart budget is 10s.
-    double total_budget = time_limit * 0.95;
-    const double min_restart = 10.0; // skip tiny restarts that won't help
+    unsigned hc = std::thread::hardware_concurrency();
+    int workers = (hc > 2) ? (int)hc - 2 : 1;
+    if (workers < 1) workers = 1;
+
+    std::vector<std::future<std::pair<double, Design>>> futures;
+    futures.reserve((size_t)workers);
+
+    for (int w = 0; w < workers; w++) {
+        unsigned seed_base = 12345u + (unsigned)w * 101u;
+        futures.push_back(std::async(std::launch::async, [=]() {
+            return run_search(d, time_limit, seed_base);
+        }));
+    }
 
     Design best_d = d;
     double best_cost = 1e18;
-    int restart = 0;
-
-    unsigned seeds[][2] = {{42,123},{7,31},{13,37},{99,17},{101,53},{200,77},{300,91},{400,111}};
-
-    // Multi-start restarts within the time budget.
-    while (elapsed() < total_budget) {
-        double remaining = total_budget - elapsed();
-        if (remaining < min_restart) break;
-
-        double sa1_t = remaining * 0.75;
-        double sa2_t = remaining * 0.20;
-        int si = restart % 8;
-        unsigned seed1 = seeds[si][0], seed2 = seeds[si][1];
-
-        std::cerr << "[Restart " << restart << "] seeds=" << seed1 << "/" << seed2
-                  << " budget=" << remaining << "s\n";
-
-        Design trial = d;
-        double cost = run_once(trial, sa1_t, sa2_t, seed1, seed2);
-        std::cerr << "  cost=" << cost << "\n";
-
+    for (auto& fut : futures) {
+        auto [cost, cand] = fut.get();
         if (cost < best_cost) {
             best_cost = cost;
-            best_d = trial;
-            std::cerr << "  ** new best **\n";
+            best_d = cand;
         }
-        restart++;
     }
 
     std::cerr << "[Final] Writing output\n";
