@@ -75,3 +75,5 @@ Testing/
 *.in
 *.DS_Store
 *.log
+input/
+output/
