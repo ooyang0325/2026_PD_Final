@@ -210,7 +210,7 @@ int main(int argc, char* argv[]) {
     };
 
     std::cerr << "[Phase 1] Parsing " << in_path << "\n";
-    Design d = Parser::load(in_path);
+    Design d = Parser::load_csv(in_path);
     if (d.blocks.empty()) {
         std::cerr << "ERROR: No blocks loaded.\n";
         return 1;
