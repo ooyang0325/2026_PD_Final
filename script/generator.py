@@ -47,7 +47,8 @@ class ICCADTestcaseGenerator:
                 # 重新校準面積確保 W * H = Area
                 area = round(width * height, 1)
                 
-                loc = random.choice(edge_locations) if btype == 'EDGE' else ""
+                loc = random.choice(edge_locations) if btype == 'EDGE' else "" 
+                edge_locations.remove(loc) if loc in edge_locations else None              
                 ar_range = "1"
             else: # SOFT
                 width = ""

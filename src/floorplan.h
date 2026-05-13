@@ -103,6 +103,48 @@ public:
         }
     }
 
+    // Push edge blocks to extreme positions in the sequence pair so that
+    // finalize_edge_blocks() never creates block overlaps.  The rules are:
+    //   'B' (bottom snap) → first in gp, last in gm  → block is packed at y=0
+    //   'T' (top snap)    → last  in gp, first in gm → block is packed at y=max
+    //   'L' only          → first in both gp and gm  → block is packed at x=0
+    //   'R' only          → last  in both gp and gm  → block is packed at x=max
+    // After the snap, all non-edge blocks are strictly inside the snapped
+    // edge block's zone (guaranteed by the HALO gap in the sequence-pair packing).
+    void enforce_edge_block_extremes() {
+        auto move_to_front = [](std::vector<int>& v, int val) {
+            auto it = std::find(v.begin(), v.end(), val);
+            if (it != v.begin()) std::rotate(v.begin(), it, it + 1);
+        };
+        auto move_to_back = [](std::vector<int>& v, int val) {
+            auto it = std::find(v.begin(), v.end(), val);
+            if (it != v.end() - 1) std::rotate(it, it + 1, v.end());
+        };
+
+        for (int i : edge_block_idx) {
+            int li = std::min(active_loc[i], (int)d.blocks[i].locations.size() - 1);
+            const std::string& loc = d.blocks[i].locations[li];
+            bool has_B = (loc.find('B') != std::string::npos);
+            bool has_T = (loc.find('T') != std::string::npos);
+            bool has_L = (loc.find('L') != std::string::npos);
+            bool has_R = (loc.find('R') != std::string::npos);
+
+            if (has_B) {
+                move_to_front(sp.gp, i);
+                move_to_back (sp.gm, i);
+            } else if (has_T) {
+                move_to_back (sp.gp, i);
+                move_to_front(sp.gm, i);
+            } else if (has_L) {
+                move_to_front(sp.gp, i);
+                move_to_front(sp.gm, i);
+            } else if (has_R) {
+                move_to_back (sp.gp, i);
+                move_to_back (sp.gm, i);
+            }
+        }
+    }
+
     double compute_hpwl() const {
         double total = 0;
         for (auto& conn : d.connections) {
@@ -118,7 +160,7 @@ public:
         double cost = (chip_w * chip_h) + alpha * compute_hpwl();
         if (chip_w > max_w) cost += 1e8 * (chip_w - max_w);
         if (chip_h > max_h) cost += 1e8 * (chip_h - max_h);
-        cost += edge_block_penalty(max_w, max_h); // 注意：對齊目標是 MAX_W / MAX_H
+        cost += edge_block_penalty(chip_w, chip_h); // push edge blocks to actual chip boundary
         return cost;
     }
 

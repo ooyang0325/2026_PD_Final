@@ -76,27 +76,58 @@ static double compute_final_cost(const Design& d) {
 
 // Run one complete solve cycle. Returns final cost (without overflow penalty).
 // Modifies d with the result (block positions, paths, channels).
-// One full solve: coarse SA -> channelize -> fine SA -> route -> FT update -> reroute.
+// Flow: coarse SA -> fine SA -> 4x (route -> FT expand via full repack -> finalize).
 static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned seed1, unsigned seed2) {
-    Design d = d_in; 
-
+    Design d = d_in;
     Floorplan fp(d);
+
+    // Pack with actual chip size (not max), recompute channels.
+    // Does NOT snap edge blocks — safe to call during FT iterations (no overlap risk).
+    auto pack_intermediate = [&]() {
+        auto [tw, th] = fp.pack();
+        double aw = std::min(tw, d.outline.max_width);
+        double ah = std::min(th, d.outline.max_height);
+        d.outline.cur_width  = aw;
+        d.outline.cur_height = ah;
+        d.channels = ChannelCalculator::compute(d.blocks, aw, ah);
+    };
+
+    // Full finalize: pack + snap edge blocks to the compact boundary + recompute channels.
+    // Only call this for the final output step to avoid snap-induced overlaps during
+    // intermediate FT repacks (the sequence pair does not guarantee edge blocks stay
+    // at the extremes after soft-block size changes).
+    auto finalize_output = [&]() {
+        auto [tw, th] = fp.pack();
+        double aw = std::min(tw, d.outline.max_width);
+        double ah = std::min(th, d.outline.max_height);
+        d.outline.cur_width  = aw;
+        d.outline.cur_height = ah;
+        fp.finalize_edge_blocks(aw, ah);
+        d.channels = ChannelCalculator::compute(d.blocks, aw, ah);
+    };
+
+    // Collect FT net loads from current routing paths into fp.ft_nets.
+    auto collect_ft = [&]() {
+        std::fill(fp.ft_nets.begin(), fp.ft_nets.end(), 0);
+        for (auto& path : d.paths) {
+            for (int si = 1; si < (int)path.segments.size() - 1; si++) {
+                auto& seg = path.segments[si];
+                if (seg.rect_name.substr(0,2) != "CH") {
+                    int bi = d.block_idx(seg.rect_name);
+                    if (bi >= 0 && d.blocks[bi].type == BlockType::SOFT)
+                        fp.ft_nets[bi] += path.nets;
+                }
+            }
+        }
+    };
+
+    // ── SA phase 1 ──────────────────────────────────────────────────────────
     SAOptimizer sa(fp, seed1);
     sa.time_limit_sec = sa1_time;
     sa.run();
+    finalize_output();
 
-    auto [_, _] = fp.pack();
-    // 關鍵修改：強行將全局版面設定為大會給定的 MAX_OUTLINE
-    d.outline.cur_width = d.outline.max_width;
-    d.outline.cur_height = d.outline.max_height;
-    
-    // 將 Edge Blocks 精準歸位至 MAX_OUTLINE 的邊界，因為 SA 已經預留了完美空洞
-    fp.finalize_edge_blocks(d.outline.max_width, d.outline.max_height);
-    
-    // 生成 Channel 時以 max_width/height 為畫布，這將吸收所有剩餘空間作為強大通道
-    d.channels = ChannelCalculator::compute(d.blocks, d.outline.max_width, d.outline.max_height);
-
-    // Phase 2: 細緻調整與預佈線
+    // ── SA phase 2 (fine, with FT-area pre-estimate) ────────────────────────
     SAOptimizer sa2(fp, seed2);
     sa2.time_limit_sec = sa2_time;
     sa2.T_init = 1e6;
@@ -104,40 +135,111 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
     sa2.update_ft_areas();
     fp.apply_ft_areas();
     sa2.run();
+    finalize_output();
 
-    fp.pack();
-    fp.finalize_edge_blocks(d.outline.max_width, d.outline.max_height);
-    d.channels = ChannelCalculator::compute(d.blocks, d.outline.max_width, d.outline.max_height);
+    // ── Iterative route -> FT check -> expand -> repack ─────────────────────
+    // Route on current layout.  If every soft block already has enough area for the
+    // observed FT load, stop.  Otherwise expand blocks and repack (without snapping
+    // edge blocks, to avoid snap-induced overlaps), then route again.  Cap at 8 rounds.
+    // After the loop converges, do one final snap + route to produce the output.
+    for (int ft_iter = 0; ft_iter < 8; ft_iter++) {
+        GlobalRouter gri;
+        gri.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
+        gri.route_all(d, 20);
 
-    GlobalRouter gr;
-    gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
-    gr.route_all(d, 20); // 增加 Reroute 次數，保證 50 blocks 能繞通
+        collect_ft();
 
-    std::fill(fp.ft_nets.begin(), fp.ft_nets.end(), 0);
-    for (auto& path : d.paths) {
-        for (int si = 1; si < (int)path.segments.size() - 1; si++) {
-            auto& seg = path.segments[si];
-            if (seg.rect_name.substr(0,2) != "CH") {
-                int bi = d.block_idx(seg.rect_name);
-                if (bi >= 0 && d.blocks[bi].type == BlockType::SOFT)
-                    fp.ft_nets[bi] += path.nets;
+        bool needs_expand = false;
+        for (int i = 0; i < (int)d.blocks.size(); i++) {
+            if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
+            double required = d.blocks[i].get_target_area(fp.ft_nets[i]);
+            if (fp.W[i] * fp.H[i] < required - 1.0) { needs_expand = true; break; }
+        }
+
+        if (!needs_expand) break;
+
+        fp.apply_ft_areas(false);
+        pack_intermediate(); // no edge-block snap during FT repacks
+    }
+
+    // FT convergence with snapped edge blocks.
+    // Each iteration: snap → check overlap → route → check FT → if needed expand → repeat.
+    // Tracks the last known-good state (post-snap, post-route, no overlap) so that if
+    // a later expansion iteration creates overlaps, we recover the best valid result
+    // instead of always reverting all the way to the pre-loop unsnapped state.
+    Design       pre_snap_d = d;
+    std::vector<double> pre_snap_W = fp.W, pre_snap_H = fp.H;
+
+    // last_good tracks the best valid snapped+routed state seen so far.
+    Design       last_good_d  = pre_snap_d;
+    std::vector<double> last_good_W = pre_snap_W, last_good_H = pre_snap_H;
+    bool snap_has_good = false;
+
+    auto has_overlap = [&]() {
+        int nb = (int)d.blocks.size();
+        for (int i = 0; i < nb; i++) {
+            for (int j = i+1; j < nb; j++) {
+                double ox = std::min(d.blocks[i].lx + d.blocks[i].width,
+                                     d.blocks[j].lx + d.blocks[j].width)
+                          - std::max(d.blocks[i].lx, d.blocks[j].lx);
+                double oy = std::min(d.blocks[i].ly + d.blocks[i].height,
+                                     d.blocks[j].ly + d.blocks[j].height)
+                          - std::max(d.blocks[i].ly, d.blocks[j].ly);
+                if (ox > 0.01 && oy > 0.01) return true;
             }
         }
-    }
-    
-    fp.apply_ft_areas(false);
-    fp.pack();
-    fp.finalize_edge_blocks(d.outline.max_width, d.outline.max_height);
-    d.channels = ChannelCalculator::compute(d.blocks, d.outline.max_width, d.outline.max_height);
+        return false;
+    };
 
-    GlobalRouter gr2;
-    gr2.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
-    gr2.route_all(d, 20);
+    for (int snap_iter = 0; snap_iter < 8; snap_iter++) {
+        finalize_output();
+
+        if (has_overlap()) {
+            if (snap_has_good) {
+                // Recover the last overlap-free snapped+routed state.
+                d = last_good_d;
+                fp.W = last_good_W;
+                fp.H = last_good_H;
+            } else {
+                // No good snap seen yet — fall back to pre-loop state, snap once, and route.
+                d = pre_snap_d;
+                fp.W = pre_snap_W;
+                fp.H = pre_snap_H;
+                finalize_output();
+                GlobalRouter grf;
+                grf.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
+                grf.route_all(d, 20);
+            }
+            break;
+        }
+
+        GlobalRouter grs;
+        grs.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
+        grs.route_all(d, 20);
+
+        collect_ft();
+
+        // Save this iteration as last known-good (valid snap + valid paths).
+        last_good_d = d;
+        last_good_W = fp.W;
+        last_good_H = fp.H;
+        snap_has_good = true;
+
+        bool needs_expand = false;
+        for (int i = 0; i < (int)d.blocks.size(); i++) {
+            if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
+            double required = d.blocks[i].get_target_area(fp.ft_nets[i]);
+            if (fp.W[i] * fp.H[i] < required - 1.0) { needs_expand = true; break; }
+        }
+        if (!needs_expand) break;
+
+        fp.apply_ft_areas(false);
+    }
 
     double cost = compute_final_cost(d);
     for (auto& ch : d.channels) if (ch.overflowed()) cost += 1e9;
 
-    d_in = d; 
+    d_in = d;
     return cost;
 }
 
@@ -215,7 +317,8 @@ int main(int argc, char* argv[]) {
               << "  alpha = " << d.alpha << "\n";
 
     double time_limit = std::max(30.0, std::min(20 * std::pow((double)1.124, (double)d.blocks.size()), 7100.0)); // Scale time limit with block count
-
+    if(argv[3] != nullptr) time_limit = std::stod(argv[3]);
+    
     std::cerr << "[Phase 2] Running search with time limit " << time_limit << "s\n";
 
     unsigned hc = std::thread::hardware_concurrency();
