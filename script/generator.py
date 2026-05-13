@@ -87,7 +87,7 @@ class ICCADTestcaseGenerator:
                 if random.random() < sparsity:
                     # 隨機生成 Net 數量 (100 ~ 3000)
                     # 刻意產生一些容易觸發 FT Overflow (> 1000) 的測資
-                    nets = random.choice([100, 200, 300, 500, 800, 1200, 1500, 2000, 3500])
+                    nets = random.choice([100, 200, 300, 500, 800, 1200, 1500, 2000])
                     self.conn_matrix[i][j] = nets
                     self.conn_matrix[j][i] = nets
 

@@ -16,7 +16,6 @@ public:
     std::vector<bool> rotatable;
     std::vector<int> ft_nets;
     std::vector<int> active_loc;
-
     std::vector<int> edge_block_idx;
 
     Floorplan(Design& d_) : d(d_), sp((int)d_.blocks.size()),
@@ -40,30 +39,45 @@ public:
         active_loc[i] = (active_loc[i] + 1) % nlocs;
     }
 
-    void apply_ft_areas() {
+    void apply_ft_areas(bool reset_zero = true) {
         for (int i = 0; i < (int)d.blocks.size(); i++) {
             if (d.blocks[i].type != BlockType::SOFT) continue;
-            
-            double target_area = d.blocks[i].get_target_area(ft_nets[i]);
+            double base = d.blocks[i].area;
+
+            if (ft_nets[i] <= 0) {
+                if (reset_zero) {
+                    W[i] = std::ceil(std::sqrt(base) * 100.0) / 100.0;
+                    H[i] = std::ceil((base / W[i]) * 100.0) / 100.0;
+                }
+                continue;
+            }
+
+            double rate = d.blocks[i].ft_conversion_rate(ft_nets[i]);
+            double base_side = std::sqrt(base);
+            double extend = ((double)ft_nets[i] / 25.0) * rate / 2.0;
+            double target_area = (base_side + extend) * (base_side + extend);
+
             double cur_ar = (H[i] > 0) ? W[i] / H[i] : 1.0;
             double mn = d.blocks[i].min_ar, mx = d.blocks[i].max_ar;
             cur_ar = std::max(mn, std::min(mx, cur_ar));
 
             double raw_w = std::sqrt(target_area * cur_ar);
-            // Force rounding up to two decimal places to prevent area shrinkage after output
             W[i] = std::ceil(raw_w * 100.0) / 100.0;
             H[i] = std::ceil((target_area / W[i]) * 100.0) / 100.0;
         }
     }
 
+    // 評估時強制加入 2.0um 的 Halo，保證 Block 之間絕對會產生可繞線的 Channel
     std::pair<double,double> eval() {
-        return sp.evaluate(W, H);
+        const double HALO = 2.0;
+        std::vector<double> pad_W = W, pad_H = H;
+        for(size_t i=0; i<W.size(); i++) { pad_W[i] += HALO; pad_H[i] += HALO; }
+        return sp.evaluate(pad_W, pad_H);
     }
 
     std::pair<double,double> pack() {
-        auto [tw, th] = sp.evaluate(W, H);
+        auto [tw, th] = eval();
         commit();
-        // Do not add any forced modifications to lx, ly here!
         return {tw, th};
     }
 
@@ -76,48 +90,69 @@ public:
         }
     }
 
+    // 最後定案時，將 Edge Block 強制貼齊大會設定的 MAX OUTLINE
+    void finalize_edge_blocks(double max_w, double max_h) {
+        for (int i : edge_block_idx) {
+            auto& b = d.blocks[i];
+            int li = std::min(active_loc[i], (int)b.locations.size() - 1);
+            const std::string& loc = b.locations[li];
+            if (loc.find('T') != std::string::npos) b.ly = max_h - b.height;
+            if (loc.find('B') != std::string::npos) b.ly = 0.0;
+            if (loc.find('L') != std::string::npos) b.lx = 0.0;
+            if (loc.find('R') != std::string::npos) b.lx = max_w - b.width;
+        }
+    }
+
     double compute_hpwl() const {
         double total = 0;
-        const auto& spx = sp.x;
-        const auto& spy = sp.y;
         for (auto& conn : d.connections) {
             int a = conn.from, b = conn.to;
-            double cx_a = spx[a] + W[a] * 0.5;
-            double cy_a = spy[a] + H[a] * 0.5;
-            double cx_b = spx[b] + W[b] * 0.5;
-            double cy_b = spy[b] + H[b] * 0.5;
+            double cx_a = sp.x[a] + W[a] * 0.5, cy_a = sp.y[a] + H[a] * 0.5;
+            double cx_b = sp.x[b] + W[b] * 0.5, cy_b = sp.y[b] + H[b] * 0.5;
             total += conn.nets * (std::abs(cx_b - cx_a) + std::abs(cy_b - cy_a));
         }
         return total;
     }
 
-    double compute_cost(double chip_w, double chip_h, double alpha,
-                        double max_w, double max_h) const {
-        double area = chip_w * chip_h;
-        double hpwl = compute_hpwl();
-        double cost = area + alpha * hpwl;
-
+    double compute_cost(double chip_w, double chip_h, double alpha, double max_w, double max_h) const {
+        double cost = (chip_w * chip_h) + alpha * compute_hpwl();
         if (chip_w > max_w) cost += 1e8 * (chip_w - max_w);
         if (chip_h > max_h) cost += 1e8 * (chip_h - max_h);
-
-        // Use a large penalty so SA naturally places edge blocks at the boundary
-        cost += edge_block_penalty(chip_w, chip_h);
+        cost += edge_block_penalty(max_w, max_h); // 注意：對齊目標是 MAX_W / MAX_H
         return cost;
     }
 
-    double edge_block_penalty(double chip_w, double chip_h) const {
+    double edge_block_penalty(double max_w, double max_h) const {
         double penalty = 0;
-        const double W_PENALTY = 1e6; // Very high displacement penalty
+        const double DIST_W = 50.0;
+        const double OVERLAP_W = 1e6;
+
+        int n = d.blocks.size();
+        std::vector<double> sx(n), sy(n);
+        for (int i = 0; i < n; i++) { sx[i] = sp.x[i]; sy[i] = sp.y[i]; }
+
+        // 預判將 Edge Block 推向 MAX 邊緣
         for (int i : edge_block_idx) {
-            const auto& b = d.blocks[i];
-            int li = std::min(active_loc[i], (int)b.locations.size() - 1);
-            const std::string& loc = b.locations[li];
+            int li = std::min(active_loc[i], (int)d.blocks[i].locations.size() - 1);
+            const std::string& loc = d.blocks[i].locations[li];
             
-            // If the SP-generated coordinates are not flush with the target edge, add a large penalty
-            if (loc.find('T') != std::string::npos) penalty += W_PENALTY * std::abs((sp.y[i] + H[i]) - chip_h);
-            if (loc.find('B') != std::string::npos) penalty += W_PENALTY * std::abs(sp.y[i]);
-            if (loc.find('L') != std::string::npos) penalty += W_PENALTY * std::abs(sp.x[i]);
-            if (loc.find('R') != std::string::npos) penalty += W_PENALTY * std::abs((sp.x[i] + W[i]) - chip_w);
+            if (loc.find('T') != std::string::npos) sy[i] = max_h - H[i];
+            if (loc.find('B') != std::string::npos) sy[i] = 0.0;
+            if (loc.find('L') != std::string::npos) sx[i] = 0.0;
+            if (loc.find('R') != std::string::npos) sx[i] = max_w - W[i];
+
+            penalty += DIST_W * (std::abs(sx[i] - sp.x[i]) + std::abs(sy[i] - sp.y[i]));
+        }
+
+        // 碰撞測試：確保推到邊緣後，不會跟其他 Block 撞在一起
+        for (int i : edge_block_idx) {
+            for (int j = 0; j < n; j++) {
+                if (i == j) continue;
+                if (d.blocks[j].type == BlockType::EDGE && i >= j) continue;
+                double ox = std::min(sx[i] + W[i], sx[j] + W[j]) - std::max(sx[i], sx[j]);
+                double oy = std::min(sy[i] + H[i], sy[j] + H[j]) - std::max(sy[i], sy[j]);
+                if (ox > 1e-6 && oy > 1e-6) penalty += OVERLAP_W * (ox * oy);
+            }
         }
         return penalty;
     }

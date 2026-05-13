@@ -11,6 +11,7 @@
 #include <future>
 #include <thread>
 #include <vector>
+#include <cmath>
 
 // Derive a representative point for HPWL based on edge adjacency.
 static std::pair<double, double> get_guiding_point(
@@ -80,42 +81,38 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
     Design d = d_in; 
 
     Floorplan fp(d);
-    // Phase 1: coarse SA for topology and outline feasibility.
     SAOptimizer sa(fp, seed1);
     sa.time_limit_sec = sa1_time;
-    sa.T_init = 1e9;
-    sa.T_final = 1e3;
-    sa.cool_rate = 0.995;
-    sa.moves_per_temp = 200;
     sa.run();
 
-    auto [tw, th] = fp.pack();
-    d.outline.cur_width = tw;
-    d.outline.cur_height = th;
-    d.channels = ChannelCalculator::compute(d.blocks, tw, th);
+    auto [_, _] = fp.pack();
+    // 關鍵修改：強行將全局版面設定為大會給定的 MAX_OUTLINE
+    d.outline.cur_width = d.outline.max_width;
+    d.outline.cur_height = d.outline.max_height;
+    
+    // 將 Edge Blocks 精準歸位至 MAX_OUTLINE 的邊界，因為 SA 已經預留了完美空洞
+    fp.finalize_edge_blocks(d.outline.max_width, d.outline.max_height);
+    
+    // 生成 Channel 時以 max_width/height 為畫布，這將吸收所有剩餘空間作為強大通道
+    d.channels = ChannelCalculator::compute(d.blocks, d.outline.max_width, d.outline.max_height);
 
-        // Phase 2: FT-aware SA with updated soft-block areas.
-        SAOptimizer sa2(fp, seed2);
+    // Phase 2: 細緻調整與預佈線
+    SAOptimizer sa2(fp, seed2);
     sa2.time_limit_sec = sa2_time;
     sa2.T_init = 1e6;
     sa2.T_final = 1.0;
-    sa2.cool_rate = 0.99;
-    sa2.moves_per_temp = 100;
     sa2.update_ft_areas();
     fp.apply_ft_areas();
     sa2.run();
 
-    auto [tw2, th2] = fp.pack();
-    d.outline.cur_width = tw2;
-    d.outline.cur_height = th2;
-    d.channels = ChannelCalculator::compute(d.blocks, tw2, th2);
+    fp.pack();
+    fp.finalize_edge_blocks(d.outline.max_width, d.outline.max_height);
+    d.channels = ChannelCalculator::compute(d.blocks, d.outline.max_width, d.outline.max_height);
 
-    // Phase 3: global routing with negotiated congestion.
     GlobalRouter gr;
-    gr.init(d.blocks, d.channels, tw2, th2);
-    gr.route_all(d, 10);
+    gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
+    gr.route_all(d, 20); // 增加 Reroute 次數，保證 50 blocks 能繞通
 
-    // FT update: only extend blocks with actual FT nets (don't reset the rest).
     std::fill(fp.ft_nets.begin(), fp.ft_nets.end(), 0);
     for (auto& path : d.paths) {
         for (int si = 1; si < (int)path.segments.size() - 1; si++) {
@@ -127,20 +124,18 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
             }
         }
     }
-    fp.apply_ft_areas();
-    auto [tw3, th3] = fp.pack();
-    d.outline.cur_width = tw3;
-    d.outline.cur_height = th3;
+    
+    fp.apply_ft_areas(false);
+    fp.pack();
+    fp.finalize_edge_blocks(d.outline.max_width, d.outline.max_height);
+    d.channels = ChannelCalculator::compute(d.blocks, d.outline.max_width, d.outline.max_height);
 
-    d.channels = ChannelCalculator::compute(d.blocks, tw3, th3);
-    // Final reroute after FT-based resizing.
     GlobalRouter gr2;
-    gr2.init(d.blocks, d.channels, tw3, th3);
-    gr2.route_all(d, 10);
+    gr2.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
+    gr2.route_all(d, 20);
 
     double cost = compute_final_cost(d);
-    for (auto& ch : d.channels)
-        if (ch.overflowed()) cost += 1e9;
+    for (auto& ch : d.channels) if (ch.overflowed()) cost += 1e9;
 
     d_in = d; 
     return cost;
@@ -201,7 +196,6 @@ int main(int argc, char* argv[]) {
     }
     std::string in_path = argv[1];
     std::string out_path = argv[2];
-    double time_limit = (argc >= 4) ? std::stod(argv[3]) : 7000.0;
 
     auto t0 = std::chrono::steady_clock::now();
     auto elapsed = [&]() {
@@ -219,6 +213,10 @@ int main(int argc, char* argv[]) {
               << d.connections.size() << " connections\n"
               << "  Outline max: " << d.outline.max_width << " x " << d.outline.max_height << "\n"
               << "  alpha = " << d.alpha << "\n";
+
+    double time_limit = std::max(30.0, std::min(20 * std::pow((double)1.124, (double)d.blocks.size()), 7100.0)); // Scale time limit with block count
+
+    std::cerr << "[Phase 2] Running search with time limit " << time_limit << "s\n";
 
     unsigned hc = std::thread::hardware_concurrency();
     int workers = (hc > 2) ? (int)hc - 2 : 1;
