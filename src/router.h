@@ -112,7 +112,8 @@ public:
     }
 
     // Rip-up and reroute: iteratively increase penalty for overflowed channels.
-    bool route_all(Design& d, int max_rr = 8) {
+    // If failed_conn is non-null, indices of connections with no route are appended.
+    bool route_all(Design& d, int max_rr = 8, std::vector<int>* failed_conn = nullptr) {
         for (auto& ch : d.channels) {
             const_cast<Channel&>(ch).nets_x = 0;
             const_cast<Channel&>(ch).nets_y = 0;
@@ -126,6 +127,7 @@ public:
         });
 
         bool all_ok = false;
+        std::vector<char> routed(d.connections.size(), 0);
         for (int rr = 0; rr <= max_rr; rr++) {
             auto adj = build_adj();
             d.paths.clear();
@@ -134,6 +136,7 @@ public:
                 const_cast<Channel&>(ch).nets_y = 0;
             }
             all_ok = true;
+            std::fill(routed.begin(), routed.end(), 0);
 
             for (int ci : order) {
                 auto& conn = d.connections[ci];
@@ -141,6 +144,7 @@ public:
                 if (path.segments.empty()) {
                     all_ok = false;
                 } else {
+                    routed[ci] = 1;
                     accum_nets(path, conn.nets, d);
                     d.paths.push_back(path);
                 }
@@ -154,6 +158,12 @@ public:
                 }
             }
             if (!overflow && all_ok) break;
+        }
+        if (failed_conn) {
+            failed_conn->clear();
+            for (int ci = 0; ci < (int)d.connections.size(); ci++) {
+                if (!routed[ci]) failed_conn->push_back(ci);
+            }
         }
         return all_ok;
     }

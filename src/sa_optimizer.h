@@ -18,6 +18,12 @@ public:
     double cool_rate = 0.99;
     int moves_per_temp = 200;
     double time_limit_sec = 6000.0;
+    // Connectivity penalty is currently disabled for stability testing.
+    double conn_weight_max = 0.0;
+    int conn_top_k = 30;
+    double cong_weight_max = 3500.0;
+    int cong_bins = 10;
+    double hard_center_weight_max = 0.0;
 
     SAOptimizer(Floorplan& fp_, unsigned seed = 42)
         : fp(fp_), rng(seed) {}
@@ -38,7 +44,7 @@ public:
 
         fp.apply_ft_areas();
         auto [tw0, th0] = fp.eval();
-        double cur_cost = fp.compute_cost(tw0, th0, alpha, max_w, max_h);
+        double cur_cost = fp.compute_cost(tw0, th0, alpha, max_w, max_h, 0.0, conn_top_k, 0.0, cong_bins, 0.0);
 
         // Best-state checkpoint (saved only on improvement, not per iter)
         SequencePair::State best_state = fp.sp.save();
@@ -55,12 +61,16 @@ public:
         std::uniform_real_distribution<double> unit(0.0, 1.0);
 
         while (elapsed() < time_limit_sec) {
+            double t_frac = std::min(1.0, elapsed() / time_limit_sec);
+            double conn_weight = conn_weight_max * std::max(0.0, (t_frac - 0.2) / 0.8);
+            double cong_weight = cong_weight_max * std::max(0.0, (t_frac - 0.3) / 0.7);
+            double hard_center_weight = hard_center_weight_max * t_frac;
             if (phase == 0 && T < T_init * 1e-4) {
                 phase = 1;
                 update_ft_areas();
                 fp.apply_ft_areas();
                 auto [tw, th] = fp.eval();
-                cur_cost = fp.compute_cost(tw, th, alpha, max_w, max_h);
+                cur_cost = fp.compute_cost(tw, th, alpha, max_w, max_h, conn_weight, conn_top_k, cong_weight, cong_bins, hard_center_weight);
                 if (cur_cost < best_cost) {
                     best_cost = cur_cost;
                     best_state = fp.sp.save();
@@ -139,7 +149,7 @@ public:
                 if (!changed) continue;
 
                 auto [ntw, nth] = fp.eval();
-                double new_cost = fp.compute_cost(ntw, nth, alpha, max_w, max_h);
+                double new_cost = fp.compute_cost(ntw, nth, alpha, max_w, max_h, conn_weight, conn_top_k, cong_weight, cong_bins, hard_center_weight);
                 double delta = new_cost - cur_cost;
 
                 bool accept = (delta <= 0) || (unit(rng) < std::exp(-delta / T));
@@ -170,7 +180,7 @@ public:
             }
 
             // Time-proportional cooling: T(t) = T_init * (T_final/T_init)^(t/total)
-            double t_frac = std::min(1.0, elapsed() / time_limit_sec);
+            t_frac = std::min(1.0, elapsed() / time_limit_sec);
             T = T_init * std::pow(T_final / T_init, t_frac);
             iter++;
             if (iter % 5000 == 0) {

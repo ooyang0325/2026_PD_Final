@@ -322,6 +322,9 @@ class Evaluator:
         plt.legend()
         plt.grid(True, linestyle=':', alpha=0.6)
         plt.show()
+        # save the plot to a file
+        plt.savefig('floorplan.png')
+        print(f"Plot saved to floorplan.png")
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
