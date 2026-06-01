@@ -1,7 +1,5 @@
 #pragma once
 #include "floorplan.h"
-#include "channel.h"
-#include "router.h"
 #include <random>
 #include <cmath>
 #include <iostream>
@@ -10,20 +8,29 @@
 class SAOptimizer {
 public:
     Floorplan& fp;
-    GlobalRouter router;
     std::mt19937 rng;
 
     double T_init = 1e8;
     double T_final = 10.0;
-    double cool_rate = 0.99;
     int moves_per_temp = 200;
     double time_limit_sec = 6000.0;
-    // Connectivity penalty is currently disabled for stability testing.
-    double conn_weight_max = 0.0;
-    int conn_top_k = 30;
-    double cong_weight_max = 3500.0;
     int cong_bins = 10;
+    double cong_weight_max = 3500.0;
     double hard_center_weight_max = 0.0;
+    double slack_weight_max = 0.0;
+    double slack_ramp_start = 0.0;
+    double slack_min_frac = 0.5;
+    bool slack_decay_late = false;
+    double slack_decay_start = 0.5;
+    double ce_weight_max = 0.0;
+    double ce_ramp_start = 0.5;
+    double ce_ramp_end = 1.0;
+    bool ce_gate_feasible = false;
+    double cost_only_start = 0.0;
+    bool cost_only_mode = false;
+    bool swap_moves_only = false;
+    double repair_failed_conn_weight_max = 0.0;
+    int repair_failed_conn_top_k = 12;
 
     SAOptimizer(Floorplan& fp_, unsigned seed = 42)
         : fp(fp_), rng(seed) {}
@@ -44,7 +51,11 @@ public:
 
         fp.apply_ft_areas();
         auto [tw0, th0] = fp.eval();
-        double cur_cost = fp.compute_cost(tw0, th0, alpha, max_w, max_h, 0.0, conn_top_k, 0.0, cong_bins, 0.0);
+        double cur_cost = fp.compute_cost(
+            tw0, th0, alpha, max_w, max_h,
+            0.0, cong_bins, 0.0,
+            0.0, repair_failed_conn_top_k, 0.0, 0.0
+        );
 
         // Best-state checkpoint (saved only on improvement, not per iter)
         SequencePair::State best_state = fp.sp.save();
@@ -56,21 +67,54 @@ public:
         int phase = 0; // 0=coarse, 1=fine
         double T = T_init;
 
-        std::uniform_int_distribution<int> move_type(1, 6);
+        std::uniform_int_distribution<int> move_type(1, swap_moves_only ? 3 : 6);
         std::uniform_int_distribution<int> bidx(0, n-1);
         std::uniform_real_distribution<double> unit(0.0, 1.0);
 
         while (elapsed() < time_limit_sec) {
             double t_frac = std::min(1.0, elapsed() / time_limit_sec);
-            double conn_weight = conn_weight_max * std::max(0.0, (t_frac - 0.2) / 0.8);
-            double cong_weight = cong_weight_max * std::max(0.0, (t_frac - 0.3) / 0.7);
-            double hard_center_weight = hard_center_weight_max * t_frac;
+            double cong_weight = 0.0;
+            double hard_center_weight = 0.0;
+            double repair_failed_weight = 0.0;
+            double slack_weight = 0.0;
+            double ce_weight = 0.0;
+
+            const bool in_cost_only = cost_only_mode
+                || (cost_only_start > 0.0 && t_frac >= cost_only_start);
+
+            if (!in_cost_only) {
+                cong_weight = cong_weight_max * std::max(0.0, (t_frac - 0.3) / 0.7);
+                hard_center_weight = hard_center_weight_max * t_frac;
+                repair_failed_weight = repair_failed_conn_weight_max * std::max(0.0, (t_frac - 0.3) / 0.7);
+                double slack_frac = 0.0;
+                if (slack_weight_max > 0.0) {
+                    if (slack_ramp_start <= 0.0) {
+                        slack_frac = slack_min_frac + (1.0 - slack_min_frac) * t_frac;
+                    } else {
+                        slack_frac = std::max(0.0, (t_frac - slack_ramp_start) / (1.0 - slack_ramp_start));
+                    }
+                    if (slack_decay_late && t_frac >= slack_decay_start) {
+                        double decay = 1.0 - (t_frac - slack_decay_start) / std::max(1e-6, 1.0 - slack_decay_start);
+                        slack_frac *= std::max(0.0, decay);
+                    }
+                }
+                slack_weight = slack_weight_max * slack_frac;
+                if (ce_weight_max > 0.0 && ce_ramp_end > ce_ramp_start) {
+                    if (t_frac >= ce_ramp_start && t_frac < ce_ramp_end) {
+                        ce_weight = ce_weight_max * (t_frac - ce_ramp_start) / (ce_ramp_end - ce_ramp_start);
+                    }
+                }
+            }
             if (phase == 0 && T < T_init * 1e-4) {
                 phase = 1;
                 update_ft_areas();
                 fp.apply_ft_areas();
                 auto [tw, th] = fp.eval();
-                cur_cost = fp.compute_cost(tw, th, alpha, max_w, max_h, conn_weight, conn_top_k, cong_weight, cong_bins, hard_center_weight);
+                cur_cost = fp.compute_cost(
+                    tw, th, alpha, max_w, max_h,
+                    cong_weight, cong_bins, hard_center_weight,
+                    repair_failed_weight, repair_failed_conn_top_k, slack_weight, ce_weight
+                );
                 if (cur_cost < best_cost) {
                     best_cost = cur_cost;
                     best_state = fp.sp.save();
@@ -149,7 +193,16 @@ public:
                 if (!changed) continue;
 
                 auto [ntw, nth] = fp.eval();
-                double new_cost = fp.compute_cost(ntw, nth, alpha, max_w, max_h, conn_weight, conn_top_k, cong_weight, cong_bins, hard_center_weight);
+                double effective_ce = ce_weight;
+                if (ce_gate_feasible && effective_ce > 0.0
+                    && (ntw > max_w + 1e-6 || nth > max_h + 1e-6)) {
+                    effective_ce = 0.0;
+                }
+                double new_cost = fp.compute_cost(
+                    ntw, nth, alpha, max_w, max_h,
+                    cong_weight, cong_bins, hard_center_weight,
+                    repair_failed_weight, repair_failed_conn_top_k, slack_weight, effective_ce
+                );
                 double delta = new_cost - cur_cost;
 
                 bool accept = (delta <= 0) || (unit(rng) < std::exp(-delta / T));

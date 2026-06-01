@@ -103,12 +103,6 @@ public:
         return mt;
     }
 
-    void undo_move(int mt, int i, int j) {
-        if (mt == 1) swap_gp(i, j);
-        else if (mt == 2) swap_gm(i, j);
-        else swap_both(i, j);
-    }
-
     // Save/restore (used only for best-state checkpoints, not per-iteration)
     struct State {
         std::vector<int> gp, gm;

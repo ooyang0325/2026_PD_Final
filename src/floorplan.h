@@ -14,32 +14,24 @@ public:
     SequencePair sp;
 
     std::vector<double> W, H;
-    std::vector<bool> rotatable;
     std::vector<int> ft_nets;
     std::vector<int> active_loc;
 
     std::vector<int> edge_block_idx;
-    std::vector<int> critical_conn_idx;
+    std::vector<int> repair_failed_conn_idx;
     double edge_penalty_coeff = 2e6;
     bool edge_use_best_location = true;
 
     Floorplan(Design& d_) : d(d_), sp((int)d_.blocks.size()),
         W(d_.blocks.size()), H(d_.blocks.size()),
-        rotatable(d_.blocks.size(), false),
         ft_nets(d_.blocks.size(), 0),
         active_loc(d_.blocks.size(), 0) {
         for (int i = 0; i < (int)d.blocks.size(); i++) {
             W[i] = d.blocks[i].width;
             H[i] = d.blocks[i].height;
-            rotatable[i] = (d.blocks[i].type == BlockType::SOFT);
             if (d.blocks[i].type == BlockType::EDGE && !d.blocks[i].locations.empty())
                 edge_block_idx.push_back(i);
         }
-        critical_conn_idx.resize(d.connections.size());
-        std::iota(critical_conn_idx.begin(), critical_conn_idx.end(), 0);
-        std::sort(critical_conn_idx.begin(), critical_conn_idx.end(), [&](int a, int b) {
-            return d.connections[a].nets > d.connections[b].nets;
-        });
     }
 
     void flip_location(int i) {
@@ -47,6 +39,10 @@ public:
         int nlocs = (int)d.blocks[i].locations.size();
         if (nlocs <= 1) return;
         active_loc[i] = (active_loc[i] + 1) % nlocs;
+    }
+
+    void set_repair_failed_connections(const std::vector<int>& failed_conn_idx) {
+        repair_failed_conn_idx = failed_conn_idx;
     }
 
     void choose_best_edge_locations(double chip_w, double chip_h) {
@@ -145,9 +141,10 @@ public:
 
     double compute_cost(double chip_w, double chip_h, double alpha,
                         double max_w, double max_h,
-                        double conn_weight = 0.0, int conn_top_k = 30,
                         double cong_weight = 0.0, int cong_bins = 10,
-                        double hard_center_weight = 0.0) const {
+                        double hard_center_weight = 0.0,
+                        double repair_conn_weight = 0.0, int repair_conn_top_k = 12,
+                        double slack_weight = 0.0, double ce_weight = 0.0) const {
         double area = chip_w * chip_h;
         double hpwl = compute_hpwl();
         double cost = area + alpha * hpwl;
@@ -157,10 +154,54 @@ public:
 
         // Use a large penalty so SA naturally places edge blocks at the boundary
         cost += edge_block_penalty(chip_w, chip_h);
-        if (conn_weight > 0.0) cost += conn_weight * connectivity_penalty(chip_w, chip_h, conn_top_k);
         if (cong_weight > 0.0) cost += cong_weight * congestion_penalty(chip_w, chip_h, cong_bins);
         if (hard_center_weight > 0.0) cost += hard_center_weight * hard_center_penalty(chip_w, chip_h);
+        if (repair_conn_weight > 0.0) cost += repair_conn_weight * failed_connectivity_penalty(chip_w, chip_h, repair_conn_top_k);
+        if (slack_weight > 0.0) cost += slack_weight * slack_penalty(max_w, max_h);
+        if (ce_weight > 0.0) cost -= ce_weight * common_edge_reward();
         return cost;
+    }
+
+    // FTAFP common-edge reward: adjacent blocks in the same net share longer boundaries.
+    double common_edge_reward() const {
+        auto overlap1d = [](double a0, double a1, double b0, double b1) {
+            return std::max(0.0, std::min(a1, b1) - std::max(a0, b0));
+        };
+        double reward = 0.0;
+        for (const auto& conn : d.connections) {
+            int a = conn.from, b = conn.to;
+            double ax0 = sp.x[a], ax1 = ax0 + W[a];
+            double ay0 = sp.y[a], ay1 = ay0 + H[a];
+            double bx0 = sp.x[b], bx1 = bx0 + W[b];
+            double by0 = sp.y[b], by1 = by0 + H[b];
+            double ce = 0.0;
+            if (std::abs(ax1 - bx0) < 1e-3 || std::abs(bx1 - ax0) < 1e-3)
+                ce = std::max(ce, overlap1d(ay0, ay1, by0, by1));
+            if (std::abs(ay1 - by0) < 1e-3 || std::abs(by1 - ay0) < 1e-3)
+                ce = std::max(ce, overlap1d(ax0, ax1, bx0, bx1));
+            if (ce > 0.0) reward += std::pow((double)conn.nets, 1.2) * ce;
+        }
+        return reward;
+    }
+
+    // Per-block slack relative to fixed max outline (FTAFP Phase-1 proxy).
+    double slack_penalty(double max_w, double max_h) const {
+        if (max_w < 1e-6 || max_h < 1e-6) return 0.0;
+        double pen = 0.0;
+        const double norm = max_w * max_h;
+        for (int i = 0; i < (int)d.blocks.size(); i++) {
+            if (d.blocks[i].type == BlockType::EDGE) continue;
+            double lx = sp.x[i], ly = sp.y[i];
+            double w = W[i], h = H[i];
+            double xs = std::min(lx, max_w - (lx + w));
+            double ys = std::min(ly, max_h - (ly + h));
+            double dx = std::max(0.0, -xs);
+            double dy = std::max(0.0, -ys);
+            if (dx <= 0.0 && dy <= 0.0) continue;
+            double area_w = (w * h) / std::max(1.0, norm);
+            pen += area_w * (dx * dx + dy * dy);
+        }
+        return pen;
     }
 
     // Penalize HARD_MACRO blocks sitting near the chip center (encourage periphery).
@@ -209,7 +250,10 @@ public:
         return p;
     }
 
-    double connectivity_penalty(double chip_w, double chip_h, int top_k = 30) const {
+    double failed_connectivity_penalty_for_list(double chip_w, double chip_h,
+                                              const std::vector<int>& conn_idx,
+                                              int top_k) const {
+        if (conn_idx.empty()) return 0.0;
         struct Rect {
             double lx, ly, w, h;
             bool traversable;
@@ -283,17 +327,26 @@ public:
         };
 
         int use_k = top_k;
-        if (use_k <= 0 || use_k > (int)critical_conn_idx.size())
-            use_k = (int)critical_conn_idx.size();
+        if (use_k <= 0 || use_k > (int)conn_idx.size())
+            use_k = (int)conn_idx.size();
 
         double penalty = 0.0;
         for (int rank = 0; rank < use_k; rank++) {
-            const auto& conn = d.connections[critical_conn_idx[rank]];
+            const auto& conn = d.connections[conn_idx[rank]];
             if (!is_reachable(conn.from, conn.to)) {
                 penalty += std::pow((double)conn.nets, 1.2);
             }
         }
         return penalty;
+    }
+
+    double failed_connectivity_penalty(double chip_w, double chip_h, int top_k = 12) const {
+        if (repair_failed_conn_idx.empty()) return 0.0;
+        std::vector<int> sorted = repair_failed_conn_idx;
+        std::sort(sorted.begin(), sorted.end(), [&](int a, int b) {
+            return d.connections[a].nets > d.connections[b].nets;
+        });
+        return failed_connectivity_penalty_for_list(chip_w, chip_h, sorted, top_k);
     }
 
     double congestion_penalty(double chip_w, double chip_h, int bins = 10) const {

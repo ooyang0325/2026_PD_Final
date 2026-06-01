@@ -16,9 +16,6 @@
 
 struct SolverOptions {
     double time_limit = 7000.0;
-    bool enable_connectivity = false;
-    double conn_weight_max = 0.0;
-    int conn_top_k = 30;
     bool enable_congestion = true;
     double cong_weight_max = 8000.0;
     int cong_bins = 10;
@@ -26,19 +23,58 @@ struct SolverOptions {
     bool edge_use_best_location = true;
     bool enable_repair = true;
     double repair_sa_time = 12.0;
-    double hard_center_weight_max = 3e5;
+    double hard_center_weight_max = 1e5;
+    double repair_hard_center_scale = 0.35;
+    double sa1_slack_weight_max = 2.5e6;
+    double sa2_slack_weight_max = 1.2e6;
+    double sa2_slack_ramp_start = 0.3;
+    double sa2_slack_min_frac = 0.0;
+    double repair_slack_weight_max = 2.0e6;
+    double repair_slack_min_frac = 0.8;
+    double repair_cong_scale = 0.70;
+    double repair_conn_weight_max = 8e4;
+    int repair_conn_top_k = 12;
     int repair_trigger_open = 1;
+    double sa2_ce_weight_max = 3e4;
+    double repair_cost_improve_eps = 0.002;
+    double sa3_time = 10.0;
+    bool enable_sa3 = true;
+    bool has_seed_base = false;
+    unsigned seed_base = 12345u;
+};
+
+struct RepairScore {
+    int total_fail_proxy = INT_MAX;
+    int routing_open = INT_MAX;
+    int edge_violation_proxy = INT_MAX;
+    int outline_violation_proxy = INT_MAX;
+    int overlap_violation_proxy = INT_MAX;
+    int overflow_count = INT_MAX;
+    double final_cost = 1e18;
 };
 
 struct WorkerResult {
-    double cost = 1e18;
-    int routing_open = INT_MAX;
+    RepairScore score;
     Design d;
 };
 
-static bool better_result(int open_a, double cost_a, int open_b, double cost_b) {
-    if (open_a != open_b) return open_a < open_b;
-    return cost_a < cost_b;
+static bool better_repair_score(const RepairScore& a, const RepairScore& b) {
+    if (a.total_fail_proxy != b.total_fail_proxy) return a.total_fail_proxy < b.total_fail_proxy;
+    if (a.routing_open != b.routing_open) return a.routing_open < b.routing_open;
+    if (a.edge_violation_proxy != b.edge_violation_proxy) return a.edge_violation_proxy < b.edge_violation_proxy;
+    if (a.outline_violation_proxy != b.outline_violation_proxy) return a.outline_violation_proxy < b.outline_violation_proxy;
+    if (a.overlap_violation_proxy != b.overlap_violation_proxy) return a.overlap_violation_proxy < b.overlap_violation_proxy;
+    if (a.overflow_count != b.overflow_count) return a.overflow_count < b.overflow_count;
+    return a.final_cost < b.final_cost;
+}
+
+static bool accept_repair_result(const RepairScore& before, const RepairScore& after,
+                                 double cost_improve_eps) {
+    if (better_repair_score(after, before)) return true;
+    if (after.total_fail_proxy != before.total_fail_proxy) return false;
+    if (after.routing_open != before.routing_open) return after.routing_open < before.routing_open;
+    if (after.overflow_count != before.overflow_count) return after.overflow_count < before.overflow_count;
+    return after.final_cost < before.final_cost * (1.0 - cost_improve_eps);
 }
 
 static unsigned mix_seed(unsigned base, unsigned idx) {
@@ -51,6 +87,93 @@ static unsigned mix_seed(unsigned base, unsigned idx) {
 
 static int count_routing_open(const std::vector<int>& failed_conn) {
     return (int)failed_conn.size();
+}
+
+static int count_channel_overflow(const Design& d) {
+    int c = 0;
+    for (const auto& ch : d.channels) {
+        if (ch.overflowed()) c++;
+    }
+    return c;
+}
+
+static int outline_violation_proxy(const Design& d) {
+    int v = 0;
+    if (d.outline.cur_width > d.outline.max_width + 1e-6) v++;
+    if (d.outline.cur_height > d.outline.max_height + 1e-6) v++;
+    for (const auto& b : d.blocks) {
+        if (b.lx < -1e-6 || b.ly < -1e-6) v++;
+        if (b.lx + b.width > d.outline.cur_width + 1e-6) v++;
+        if (b.ly + b.height > d.outline.cur_height + 1e-6) v++;
+    }
+    return v;
+}
+
+static int overlap_violation_proxy(const Design& d) {
+    int v = 0;
+    for (int i = 0; i < (int)d.blocks.size(); i++) {
+        const auto& a = d.blocks[i];
+        for (int j = i + 1; j < (int)d.blocks.size(); j++) {
+            const auto& b = d.blocks[j];
+            double ox = std::max(0.0, std::min(a.lx + a.width, b.lx + b.width) - std::max(a.lx, b.lx));
+            double oy = std::max(0.0, std::min(a.ly + a.height, b.ly + b.height) - std::max(a.ly, b.ly));
+            if (ox > 1e-6 && oy > 1e-6) v++;
+        }
+    }
+    return v;
+}
+
+static bool edge_location_satisfied(const Block& b, const std::string& loc, double ow, double oh) {
+    const double tol = 1e-3;
+    if (loc.find('L') != std::string::npos && std::abs(b.lx) > tol) return false;
+    if (loc.find('R') != std::string::npos && std::abs((b.lx + b.width) - ow) > tol) return false;
+    if (loc.find('B') != std::string::npos && std::abs(b.ly) > tol) return false;
+    if (loc.find('T') != std::string::npos && std::abs((b.ly + b.height) - oh) > tol) return false;
+    return true;
+}
+
+static int edge_violation_proxy(const Design& d) {
+    int v = 0;
+    double ow = d.outline.cur_width;
+    double oh = d.outline.cur_height;
+    for (const auto& b : d.blocks) {
+        if (b.type != BlockType::EDGE || b.locations.empty()) continue;
+        bool ok = false;
+        for (const auto& loc : b.locations) {
+            if (edge_location_satisfied(b, loc, ow, oh)) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) v++;
+    }
+    return v;
+}
+
+static double compute_final_cost(const Design& d);
+
+static RepairScore score_design(const Design& d, int routing_open) {
+    RepairScore s;
+    s.routing_open = routing_open;
+    s.edge_violation_proxy = edge_violation_proxy(d);
+    s.outline_violation_proxy = outline_violation_proxy(d);
+    s.overlap_violation_proxy = overlap_violation_proxy(d);
+    s.overflow_count = count_channel_overflow(d);
+    s.final_cost = compute_final_cost(d);
+    s.total_fail_proxy = s.routing_open + s.edge_violation_proxy
+                       + s.outline_violation_proxy + s.overlap_violation_proxy;
+    return s;
+}
+
+static void log_repair_score(const char* tag, const RepairScore& s) {
+    std::cerr << tag
+              << " fail_proxy=" << s.total_fail_proxy
+              << " open=" << s.routing_open
+              << " edge=" << s.edge_violation_proxy
+              << " outline=" << s.outline_violation_proxy
+              << " overlap=" << s.overlap_violation_proxy
+              << " overflow=" << s.overflow_count
+              << " cost=" << s.final_cost << "\n";
 }
 
 static void log_failed_pairs(const Design& d, const std::vector<int>& failed_conn,
@@ -76,27 +199,56 @@ static void reroute_design(Design& d, std::vector<int>* failed_conn = nullptr) {
     gr.route_all(d, 10, failed_conn);
 }
 
-// Short SA pass after routing failures: ramp hard-at-center penalty via sequence-pair moves.
-static void run_repair_sa(Floorplan& fp, const SolverOptions& opt, unsigned seed) {
-    if (!opt.enable_repair || opt.repair_sa_time <= 0.0) return;
-    if (opt.hard_center_weight_max <= 0.0) return;
+// Short SA pass after routing failures: slack + optional hard-center / failed-pair conn.
+static void run_repair_sa(Floorplan& fp, const SolverOptions& opt, unsigned seed,
+                          const std::vector<int>& failed_conn, int routing_open,
+                          double time_budget) {
+    if (!opt.enable_repair || time_budget <= 0.0) return;
+    const bool use_hard_center = routing_open > 0 && opt.hard_center_weight_max > 0.0;
+    const bool use_slack = opt.repair_slack_weight_max > 0.0;
+    const bool use_conn = opt.repair_conn_weight_max > 0.0 && !failed_conn.empty();
+    if (!use_hard_center && !use_slack && !use_conn) return;
 
-    std::cerr << "[Repair-SA] start budget=" << opt.repair_sa_time
-              << "s hard_center_weight_max=" << opt.hard_center_weight_max << "\n";
+    std::cerr << "[Repair-SA] start budget=" << time_budget
+              << "s routing_open=" << routing_open
+              << " hard_center=" << (use_hard_center ? "on" : "off")
+              << " slack=" << (use_slack ? "on" : "off") << "\n";
 
     SAOptimizer sa(fp, seed);
-    sa.time_limit_sec = opt.repair_sa_time;
+    sa.time_limit_sec = time_budget;
     sa.T_init = 5e7;
     sa.T_final = 1.0;
-    sa.cool_rate = 0.99;
     sa.moves_per_temp = 150;
-    sa.conn_weight_max = 0.0;
-    sa.cong_weight_max = opt.enable_congestion ? opt.cong_weight_max * 0.5 : 0.0;
+    sa.cong_weight_max = opt.enable_congestion ? opt.cong_weight_max * opt.repair_cong_scale : 0.0;
     sa.cong_bins = opt.cong_bins;
-    sa.hard_center_weight_max = opt.hard_center_weight_max;
+    sa.hard_center_weight_max = use_hard_center
+        ? opt.hard_center_weight_max * opt.repair_hard_center_scale : 0.0;
+    sa.slack_weight_max = use_slack ? opt.repair_slack_weight_max : 0.0;
+    sa.slack_ramp_start = 0.0;
+    sa.slack_min_frac = opt.repair_slack_min_frac;
+    sa.repair_failed_conn_weight_max = use_conn ? opt.repair_conn_weight_max : 0.0;
+    sa.repair_failed_conn_top_k = opt.repair_conn_top_k;
+    fp.set_repair_failed_connections(failed_conn);
     sa.run();
     fp.pack();
+    fp.set_repair_failed_connections({});
     std::cerr << "[Repair-SA] done\n";
+}
+
+// Post-route cost-only SA: swap moves, minimize area + HPWL proxy.
+static void run_cost_sa3(Floorplan& fp, double time_budget, unsigned seed) {
+    if (time_budget <= 0.0) return;
+    std::cerr << "[SA3] cost-only start budget=" << time_budget << "s\n";
+    SAOptimizer sa(fp, seed);
+    sa.time_limit_sec = time_budget;
+    sa.T_init = 2e6;
+    sa.T_final = 1.0;
+    sa.moves_per_temp = 120;
+    sa.cost_only_mode = true;
+    sa.swap_moves_only = true;
+    sa.run();
+    fp.pack();
+    std::cerr << "[SA3] done\n";
 }
 
 // Derive a representative point for HPWL based on edge adjacency.
@@ -160,9 +312,13 @@ static double compute_final_cost(const Design& d) {
     return area + d.alpha * hpwl;
 }
 
-// Run one complete solve cycle. Returns final cost and routing_open count.
-// Modifies d with the result (block positions, paths, channels).
-static std::pair<double, int> run_once(Design& d_in, double sa1_time, double sa2_time,
+static bool outline_exceeds_max(const Design& d) {
+    return d.outline.cur_width > d.outline.max_width + 1e-6
+        || d.outline.cur_height > d.outline.max_height + 1e-6;
+}
+
+// Run one complete solve cycle. Returns evaluator-aligned score.
+static RepairScore run_once(Design& d_in, double sa1_time, double sa2_time,
                        unsigned seed1, unsigned seed2, const SolverOptions& opt) {
     Design d = d_in; 
 
@@ -174,12 +330,12 @@ static std::pair<double, int> run_once(Design& d_in, double sa1_time, double sa2
     sa.time_limit_sec = sa1_time;
     sa.T_init = 1e9;
     sa.T_final = 1e3;
-    sa.cool_rate = 0.995;
     sa.moves_per_temp = 200;
-    sa.conn_weight_max = opt.enable_connectivity ? opt.conn_weight_max : 0.0;
-    sa.conn_top_k = opt.conn_top_k;
     sa.cong_weight_max = opt.enable_congestion ? opt.cong_weight_max : 0.0;
     sa.cong_bins = opt.cong_bins;
+    sa.slack_weight_max = opt.sa1_slack_weight_max;
+    sa.slack_ramp_start = 0.0;
+    sa.slack_min_frac = 0.7;
     sa.run();
 
     auto [tw, th] = fp.pack();
@@ -192,12 +348,19 @@ static std::pair<double, int> run_once(Design& d_in, double sa1_time, double sa2
     sa2.time_limit_sec = sa2_time;
     sa2.T_init = 1e6;
     sa2.T_final = 1.0;
-    sa2.cool_rate = 0.99;
     sa2.moves_per_temp = 100;
-    sa2.conn_weight_max = opt.enable_connectivity ? opt.conn_weight_max : 0.0;
-    sa2.conn_top_k = opt.conn_top_k;
     sa2.cong_weight_max = opt.enable_congestion ? opt.cong_weight_max : 0.0;
     sa2.cong_bins = opt.cong_bins;
+    sa2.slack_weight_max = opt.sa2_slack_weight_max;
+    sa2.slack_ramp_start = opt.sa2_slack_ramp_start;
+    sa2.slack_min_frac = opt.sa2_slack_min_frac;
+    sa2.slack_decay_late = true;
+    sa2.slack_decay_start = 0.4;
+    sa2.ce_weight_max = opt.sa2_ce_weight_max;
+    sa2.ce_ramp_start = 0.4;
+    sa2.ce_ramp_end = 0.7;
+    sa2.ce_gate_feasible = true;
+    sa2.cost_only_start = 0.7;
     sa2.update_ft_areas();
     fp.apply_ft_areas();
     sa2.run();
@@ -239,32 +402,78 @@ static std::pair<double, int> run_once(Design& d_in, double sa1_time, double sa2
     log_failed_pairs(d, failed_conn, "[Route] after main flow");
 
     int final_open = open_after_route;
-    if (open_after_route < opt.repair_trigger_open) {
+    RepairScore base_score = score_design(d, open_after_route);
+    log_repair_score("[Repair-SA] baseline", base_score);
+    const bool need_repair = open_after_route >= opt.repair_trigger_open
+                          || outline_exceeds_max(d)
+                          || base_score.overlap_violation_proxy > 0;
+    if (!need_repair) {
         std::cerr << "[Repair-SA] skip (routing_open=" << open_after_route
-                  << " < trigger=" << opt.repair_trigger_open << ")\n";
+                  << " outline_proxy=" << base_score.outline_violation_proxy << ")\n";
     } else if (!opt.enable_repair) {
-        std::cerr << "[Repair-SA] skip (disabled, routing_open=" << open_after_route << ")\n";
+        std::cerr << "[Repair-SA] skip (disabled, routing_open=" << open_after_route
+                  << " outline_proxy=" << base_score.outline_violation_proxy << ")\n";
     } else {
+        Design before_repair = d;
+        RepairScore before_score = base_score;
         int open_before = open_after_route;
+        double repair_budget = opt.repair_sa_time;
+        if (open_after_route < opt.repair_trigger_open) repair_budget *= 0.5;
         log_failed_pairs(d, failed_conn, "[Repair-SA] before");
-        run_repair_sa(fp, opt, mix_seed(seed2, 77));
+        run_repair_sa(fp, opt, mix_seed(seed2, 77), failed_conn, open_after_route, repair_budget);
         auto [tw_r, th_r] = fp.pack();
         d.outline.cur_width = tw_r;
         d.outline.cur_height = th_r;
         failed_conn.clear();
         reroute_design(d, &failed_conn);
         final_open = count_routing_open(failed_conn);
+        RepairScore after_score = score_design(d, final_open);
+        bool accept = accept_repair_result(before_score, after_score, opt.repair_cost_improve_eps);
         std::cerr << "[Repair-SA] routing_open " << open_before
-                  << " -> " << final_open << "\n";
+                  << " -> " << final_open
+                  << " (" << (accept ? "accepted" : "rollback") << ")\n";
         log_failed_pairs(d, failed_conn, "[Repair-SA] after");
+        log_repair_score("[Repair-SA] after score", after_score);
+        if (!accept) {
+            d = before_repair;
+            final_open = open_before;
+            failed_conn.clear();
+            reroute_design(d, &failed_conn);
+            std::cerr << "[Repair-SA] reverted to baseline state\n";
+            log_failed_pairs(d, failed_conn, "[Repair-SA] reverted");
+            log_repair_score("[Repair-SA] reverted score", before_score);
+        }
     }
 
-    double cost = compute_final_cost(d);
-    for (auto& ch : d.channels)
-        if (ch.overflowed()) cost += 1e9;
+    RepairScore final_score = score_design(d, final_open);
+    if (opt.enable_sa3 && opt.sa3_time > 0.0 && final_score.total_fail_proxy == 0) {
+        Design before_sa3 = d;
+        RepairScore before_sa3_score = final_score;
+        int open_before_sa3 = final_open;
+        run_cost_sa3(fp, opt.sa3_time, mix_seed(seed2, 99));
+        auto [tw_sa3, th_sa3] = fp.pack();
+        d.outline.cur_width = tw_sa3;
+        d.outline.cur_height = th_sa3;
+        failed_conn.clear();
+        reroute_design(d, &failed_conn);
+        final_open = count_routing_open(failed_conn);
+        RepairScore after_sa3_score = score_design(d, final_open);
+        bool accept_sa3 = accept_repair_result(before_sa3_score, after_sa3_score, opt.repair_cost_improve_eps);
+        std::cerr << "[SA3] open " << open_before_sa3 << " -> " << final_open
+                  << " cost " << before_sa3_score.final_cost << " -> " << after_sa3_score.final_cost
+                  << " (" << (accept_sa3 ? "accepted" : "rollback") << ")\n";
+        if (!accept_sa3) {
+            d = before_sa3;
+            final_open = open_before_sa3;
+            failed_conn.clear();
+            reroute_design(d, &failed_conn);
+        } else {
+            final_score = after_sa3_score;
+        }
+    }
 
     d_in = d;
-    return {cost, final_open};
+    return final_score;
 }
 
 static WorkerResult run_search(const Design& d,
@@ -281,32 +490,31 @@ static WorkerResult run_search(const Design& d,
     const double min_restart = 10.0;
 
     Design best_d = d;
-    double best_cost = 1e18;
-    int best_open = INT_MAX;
+    RepairScore best_score;
     int restart = 0;
 
     while (elapsed() < total_budget) {
         double remaining = total_budget - elapsed();
         if (remaining < min_restart) break;
 
+        double sa3_reserve = (opt.enable_sa3 && opt.sa3_time > 0.0) ? opt.sa3_time : 0.0;
         double sa1_t = remaining * 0.75;
-        double sa2_t = remaining * 0.20;
+        double sa2_t = std::max(0.0, remaining * 0.20 - sa3_reserve);
 
         unsigned seed1 = mix_seed(seed_base, (unsigned)(restart * 2));
         unsigned seed2 = mix_seed(seed_base, (unsigned)(restart * 2 + 1));
 
         Design trial = d;
-        auto [cost, open] = run_once(trial, sa1_t, sa2_t, seed1, seed2, opt);
+        RepairScore trial_score = run_once(trial, sa1_t, sa2_t, seed1, seed2, opt);
 
-        if (better_result(open, cost, best_open, best_cost)) {
-            best_open = open;
-            best_cost = cost;
+        if (better_repair_score(trial_score, best_score)) {
+            best_score = trial_score;
             best_d = trial;
         }
         restart++;
     }
 
-    return {best_cost, best_open, best_d};
+    return {best_score, best_d};
 }
 
 int main(int argc, char* argv[]) {
@@ -316,12 +524,16 @@ int main(int argc, char* argv[]) {
                   << "Options:\n"
                   << "  --enable-congestion | --disable-congestion\n"
                   << "  --cong-weight <value> --cong-bins <int>\n"
-                  << "  --enable-connectivity | --disable-connectivity\n"
-                  << "  --conn-weight <value> --conn-topk <int>\n"
                   << "  --edge-penalty <value>\n"
                   << "  --edge-best-location | --edge-active-location\n"
                   << "  --enable-repair | --disable-repair  (Repair-SA on routing failure)\n"
                   << "  --repair-sa-time <sec> --hard-center-weight <value>\n"
+                  << "  --sa1-slack-weight <value> --sa2-slack-weight <value>\n"
+                  << "  --sa2-slack-ramp-start <frac> --repair-slack-weight <value>\n"
+                  << "  --sa2-ce-weight <value> --sa3-time <sec> --disable-sa3\n"
+                  << "  --repair-hard-center-scale <value> --repair-cong-scale <value>\n"
+                  << "  --repair-conn-weight <value> --repair-conn-topk <int>\n"
+                  << "  --seed-base <uint>\n"
                   << "  --repair-trigger-open <int>\n";
         return 1;
     }
@@ -348,10 +560,6 @@ int main(int argc, char* argv[]) {
         else if (arg == "--disable-congestion") opt.enable_congestion = false;
         else if (arg == "--cong-weight") opt.cong_weight_max = std::stod(need_value(arg));
         else if (arg == "--cong-bins") opt.cong_bins = std::max(2, std::stoi(need_value(arg)));
-        else if (arg == "--enable-connectivity") opt.enable_connectivity = true;
-        else if (arg == "--disable-connectivity") opt.enable_connectivity = false;
-        else if (arg == "--conn-weight") opt.conn_weight_max = std::stod(need_value(arg));
-        else if (arg == "--conn-topk") opt.conn_top_k = std::max(1, std::stoi(need_value(arg)));
         else if (arg == "--edge-penalty") opt.edge_penalty_coeff = std::stod(need_value(arg));
         else if (arg == "--edge-best-location") opt.edge_use_best_location = true;
         else if (arg == "--edge-active-location") opt.edge_use_best_location = false;
@@ -359,6 +567,18 @@ int main(int argc, char* argv[]) {
         else if (arg == "--disable-repair" || arg == "--disable-repair-sa") opt.enable_repair = false;
         else if (arg == "--repair-sa-time") opt.repair_sa_time = std::max(0.0, std::stod(need_value(arg)));
         else if (arg == "--hard-center-weight") opt.hard_center_weight_max = std::max(0.0, std::stod(need_value(arg)));
+        else if (arg == "--sa1-slack-weight") opt.sa1_slack_weight_max = std::max(0.0, std::stod(need_value(arg)));
+        else if (arg == "--sa2-slack-weight") opt.sa2_slack_weight_max = std::max(0.0, std::stod(need_value(arg)));
+        else if (arg == "--sa2-slack-ramp-start") opt.sa2_slack_ramp_start = std::max(0.0, std::min(0.95, std::stod(need_value(arg))));
+        else if (arg == "--repair-slack-weight") opt.repair_slack_weight_max = std::max(0.0, std::stod(need_value(arg)));
+        else if (arg == "--sa2-ce-weight") opt.sa2_ce_weight_max = std::max(0.0, std::stod(need_value(arg)));
+        else if (arg == "--sa3-time") opt.sa3_time = std::max(0.0, std::stod(need_value(arg)));
+        else if (arg == "--disable-sa3") opt.enable_sa3 = false;
+        else if (arg == "--repair-hard-center-scale") opt.repair_hard_center_scale = std::max(0.0, std::stod(need_value(arg)));
+        else if (arg == "--repair-cong-scale") opt.repair_cong_scale = std::max(0.0, std::stod(need_value(arg)));
+        else if (arg == "--repair-conn-weight") opt.repair_conn_weight_max = std::max(0.0, std::stod(need_value(arg)));
+        else if (arg == "--repair-conn-topk") opt.repair_conn_top_k = std::max(1, std::stoi(need_value(arg)));
+        else if (arg == "--seed-base") { opt.seed_base = (unsigned)std::stoul(need_value(arg)); opt.has_seed_base = true; }
         else if (arg == "--repair-trigger-open") opt.repair_trigger_open = std::max(0, std::stoi(need_value(arg)));
         else {
             std::cerr << "ERROR: Unknown option " << arg << "\n";
@@ -393,26 +613,25 @@ int main(int argc, char* argv[]) {
     futures.reserve((size_t)workers);
 
     for (int w = 0; w < workers; w++) {
-        unsigned seed_base = 12345u + (unsigned)w * 101u;
+        unsigned seed_base = (opt.has_seed_base ? opt.seed_base : 12345u) + (unsigned)w * 101u;
         futures.push_back(std::async(std::launch::async, [=]() {
             return run_search(d, time_limit, seed_base, opt);
         }));
     }
 
     Design best_d = d;
-    double best_cost = 1e18;
-    int best_open = INT_MAX;
+    RepairScore best_score;
     for (auto& fut : futures) {
         WorkerResult wr = fut.get();
-        if (better_result(wr.routing_open, wr.cost, best_open, best_cost)) {
-            best_open = wr.routing_open;
-            best_cost = wr.cost;
+        if (better_repair_score(wr.score, best_score)) {
+            best_score = wr.score;
             best_d = wr.d;
         }
     }
 
-    std::cerr << "[Final] Selected worker result: routing_open=" << best_open
-              << " cost=" << best_cost << "\n";
+    std::cerr << "[Final] Selected worker: fail_proxy=" << best_score.total_fail_proxy
+              << " open=" << best_score.routing_open
+              << " cost=" << best_score.final_cost << "\n";
     std::cerr << "[Final] Writing output\n";
     OutputWriter::print_summary(best_d);
     OutputWriter::write(best_d, out_path);

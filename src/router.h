@@ -9,6 +9,7 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <numeric>
 
 // ─── Directed Face Graph ────────────────────────────────────────────────────
 // Nodes: each rect (block or channel) × each edge × {entry, exit}
@@ -122,13 +123,15 @@ public:
 
         std::vector<int> order(d.connections.size());
         std::iota(order.begin(), order.end(), 0);
-        std::sort(order.begin(), order.end(), [&](int a, int b){
-            return d.connections[a].nets > d.connections[b].nets;
-        });
+        std::vector<int> fail_streak(d.connections.size(), 0);
 
         bool all_ok = false;
         std::vector<char> routed(d.connections.size(), 0);
         for (int rr = 0; rr <= max_rr; rr++) {
+            std::sort(order.begin(), order.end(), [&](int a, int b){
+                if (fail_streak[a] != fail_streak[b]) return fail_streak[a] > fail_streak[b];
+                return d.connections[a].nets > d.connections[b].nets;
+            });
             auto adj = build_adj();
             d.paths.clear();
             for (auto& ch : d.channels) {
@@ -143,8 +146,10 @@ public:
                 auto path = route_one(conn.from, conn.to, conn.nets, adj, d);
                 if (path.segments.empty()) {
                     all_ok = false;
+                    fail_streak[ci]++;
                 } else {
                     routed[ci] = 1;
+                    fail_streak[ci] = 0;
                     accum_nets(path, conn.nets, d);
                     d.paths.push_back(path);
                 }
@@ -159,6 +164,42 @@ public:
             }
             if (!overflow && all_ok) break;
         }
+
+        // Focused rescue pass for persistent failed connections.
+        if (!all_ok) {
+            std::vector<int> rescue_order;
+            rescue_order.reserve(order.size());
+            for (int ci = 0; ci < (int)d.connections.size(); ci++) {
+                if (!routed[ci]) rescue_order.push_back(ci);
+            }
+            std::sort(rescue_order.begin(), rescue_order.end(), [&](int a, int b){
+                if (fail_streak[a] != fail_streak[b]) return fail_streak[a] > fail_streak[b];
+                return d.connections[a].nets > d.connections[b].nets;
+            });
+
+            // Use reduced penalties in focused rescue to encourage hard-net completion.
+            std::vector<double> saved_pen = ch_penalty;
+            for (double& p : ch_penalty) p = std::max(1.0, p * 0.6);
+            auto adj = build_adj();
+            for (int ci : rescue_order) {
+                auto& conn = d.connections[ci];
+                auto path = route_one(conn.from, conn.to, conn.nets, adj, d);
+                if (path.segments.empty()) continue;
+                routed[ci] = 1;
+                accum_nets(path, conn.nets, d);
+                d.paths.push_back(path);
+            }
+            ch_penalty.swap(saved_pen);
+
+            all_ok = true;
+            for (char r : routed) {
+                if (!r) {
+                    all_ok = false;
+                    break;
+                }
+            }
+        }
+
         if (failed_conn) {
             failed_conn->clear();
             for (int ci = 0; ci < (int)d.connections.size(); ci++) {
