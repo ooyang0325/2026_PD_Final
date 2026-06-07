@@ -21,24 +21,46 @@ class ICCADTestcaseGenerator:
         self._calculate_outline()
         self._generate_connections()
 
+    # 12 個合法邊界區域 (參考題目圖 4)。注意：每個「角落」(TL/TR/BL/BR) 在幾何上
+    # 只能容納「一個」Block (兩個 Block 不可能同時佔據同一個角落而不重疊)，因此每個
+    # 區域至多指派給一個 Edge Block，絕不重複，避免產生無解的測資。
+    EDGE_LOCATIONS = ["TL,LT", "TR,RT", "BL,LB", "BR,RB",   # 4 個角落 (各限一個)
+                      "TM", "BM", "LM", "RM",               # 4 個邊中點
+                      "T", "B", "L", "R"]                   # 4 個自由邊
+
+    @staticmethod
+    def _edge_axes(loc):
+        """取出 location 所約束的邊 (T/B/L/R)。評測器只看 T/B/L/R，M 不予理會。"""
+        if not loc:
+            return (False, False, False, False)
+        opt = loc.split(',')[0]  # 兩個選項等價，取第一個即可
+        return ('T' in opt, 'B' in opt, 'L' in opt, 'R' in opt)
+
     def _generate_blocks(self):
         # 決定區塊類型的比例：大約 20% EDGE, 30% MACRO, 50% SOFT
         num_edge = max(1, int(self.num_blocks * 0.2))
         num_macro = max(1, int(self.num_blocks * 0.3))
+
+        # Edge Block 數量不可超過可用的「不重複」合法區域數，否則必然有兩個 Block
+        # 被指派到同一個角落 -> 幾何無解。超出時將多餘的 Edge 改為 MACRO。
+        if num_edge > len(self.EDGE_LOCATIONS):
+            num_macro += num_edge - len(self.EDGE_LOCATIONS)
+            num_edge = len(self.EDGE_LOCATIONS)
         num_soft = self.num_blocks - num_edge - num_macro
 
         types = ['EDGE'] * num_edge + ['MACRO'] * num_macro + ['SOFT'] * num_soft
         random.shuffle(types)
 
-        # Edge Block 可用的邊界限制 (參考題目圖 4 的 12 個區域)
-        edge_locations = ["TL,LT", "TM", "TR,RT", "LM", "RM", "BL,LB", "BM", "BR,RB", "T", "B", "L", "R"]
+        # 隨機挑選「不重複」的邊界區域給 Edge Block（每個角落至多一個）。
+        available = self.EDGE_LOCATIONS.copy()
+        random.shuffle(available)
 
         for i, btype in enumerate(types):
             name = f"BLK{i+1:02d}"
-            
+
             # 隨機生成基礎面積 (100,000 ~ 1,000,000)
             area = round(random.uniform(100000.0, 1000000.0), 1)
-            
+
             if btype in ['EDGE', 'MACRO']:
                 # 長寬比盡量接近 1:1 ~ 1:2
                 ar = random.uniform(0.5, 2.0)
@@ -46,9 +68,9 @@ class ICCADTestcaseGenerator:
                 height = round(area / width, 1)
                 # 重新校準面積確保 W * H = Area
                 area = round(width * height, 1)
-                
-                loc = random.choice(edge_locations) if btype == 'EDGE' else "" 
-                edge_locations.remove(loc) if loc in edge_locations else None              
+
+                # 每個 Edge Block 取一個唯一區域（pop 確保不重複）
+                loc = available.pop() if btype == 'EDGE' else ""
                 ar_range = "1"
             else: # SOFT
                 width = ""
@@ -70,11 +92,29 @@ class ICCADTestcaseGenerator:
     def _calculate_outline(self):
         total_area = sum(b["area"] for b in self.blocks)
         target_outline_area = total_area / self.utilization
-        
+
         # 隨機產生一個 Outline 的長寬比 (0.8 ~ 1.25)
         outline_ar = random.uniform(0.8, 1.25)
         self.outline_w = round(math.sqrt(target_outline_area * outline_ar), 2)
         self.outline_h = round(target_outline_area / self.outline_w, 2)
+
+        # ── 邊界可行性保證 ────────────────────────────────────────────────────
+        # 即使每個角落唯一，若 Outline 太小，同一條邊上的 Edge Block 仍可能放不下
+        # （沿邊並排的總長度超過邊長）而必然重疊/違規。這裡確保每條邊都裝得下其
+        # 上的 Edge Block：上下邊看寬度和、左右邊看高度和；不足則放大 Outline。
+        top = bot = left = right = 0.0
+        for b in self.blocks:
+            if b["type"] != "EDGE":
+                continue
+            has_t, has_b, has_l, has_r = self._edge_axes(b["loc"])
+            w, h = float(b["w"]), float(b["h"])
+            if has_t: top += w
+            if has_b: bot += w
+            if has_l: left += h
+            if has_r: right += h
+        # 留 1% 餘裕避免邊界剛好相切
+        self.outline_w = round(max(self.outline_w, top * 1.01, bot * 1.01), 2)
+        self.outline_h = round(max(self.outline_h, left * 1.01, right * 1.01), 2)
 
     def _generate_connections(self):
         n = self.num_blocks
