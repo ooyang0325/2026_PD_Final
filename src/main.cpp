@@ -81,17 +81,6 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
     Design d = d_in;
     Floorplan fp(d);
 
-    // Pack with actual chip size (not max), recompute channels.
-    // Does NOT snap edge blocks — safe to call during FT iterations (no overlap risk).
-    auto pack_intermediate = [&]() {
-        auto [tw, th] = fp.pack();
-        double aw = std::min(tw, d.outline.max_width);
-        double ah = std::min(th, d.outline.max_height);
-        d.outline.cur_width  = aw;
-        d.outline.cur_height = ah;
-        d.channels = ChannelCalculator::compute(d.blocks, aw, ah);
-    };
-
     // Full finalize: pack + snap edge blocks to the compact boundary + recompute channels.
     // Only call this for the final output step to avoid snap-induced overlaps during
     // intermediate FT repacks (the sequence pair does not guarantee edge blocks stay
@@ -127,54 +116,15 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
     sa.run();
     finalize_output();
 
-    // ── SA phase 2 (fine, with FT-area pre-estimate) ────────────────────────
+    // ── SA phase 2 (fine) ───────────────────────────────────────────────────
+    // No FT pre-expansion: pack at base area to satisfy the fixed outline; the
+    // convergence loop below sizes soft blocks to the real feedthrough.
     SAOptimizer sa2(fp, seed2);
     sa2.time_limit_sec = sa2_time;
-    sa2.T_init = 1e6;
-    sa2.T_final = 1.0;
-    sa2.update_ft_areas();
-    fp.apply_ft_areas();
     sa2.run();
     finalize_output();
 
-    // ── Iterative route -> FT check -> expand -> repack ─────────────────────
-    // Route on current layout.  If every soft block already has enough area for the
-    // observed FT load, stop.  Otherwise expand blocks and repack (without snapping
-    // edge blocks, to avoid snap-induced overlaps), then route again.  Cap at 8 rounds.
-    // After the loop converges, do one final snap + route to produce the output.
-    for (int ft_iter = 0; ft_iter < 8; ft_iter++) {
-        GlobalRouter gri;
-        gri.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
-        gri.route_all(d, 20);
-
-        collect_ft();
-
-        bool needs_expand = false;
-        for (int i = 0; i < (int)d.blocks.size(); i++) {
-            if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
-            double required = d.blocks[i].get_target_area(fp.ft_nets[i]);
-            if (fp.W[i] * fp.H[i] < required - 1.0) { needs_expand = true; break; }
-        }
-
-        if (!needs_expand) break;
-
-        fp.apply_ft_areas(false);
-        pack_intermediate(); // no edge-block snap during FT repacks
-    }
-
-    // FT convergence with snapped edge blocks.
-    // Each iteration: snap → check overlap → route → check FT → if needed expand → repeat.
-    // Tracks the last known-good state (post-snap, post-route, no overlap) so that if
-    // a later expansion iteration creates overlaps, we recover the best valid result
-    // instead of always reverting all the way to the pre-loop unsnapped state.
-    Design       pre_snap_d = d;
-    std::vector<double> pre_snap_W = fp.W, pre_snap_H = fp.H;
-
-    // last_good tracks the best valid snapped+routed state seen so far.
-    Design       last_good_d  = pre_snap_d;
-    std::vector<double> last_good_W = pre_snap_W, last_good_H = pre_snap_H;
-    bool snap_has_good = false;
-
+    // Block overlap test on the committed layout.
     auto has_overlap = [&]() {
         int nb = (int)d.blocks.size();
         for (int i = 0; i < nb; i++) {
@@ -191,39 +141,59 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         return false;
     };
 
-    for (int snap_iter = 0; snap_iter < 8; snap_iter++) {
-        finalize_output();
-
-        if (has_overlap()) {
-            if (snap_has_good) {
-                // Recover the last overlap-free snapped+routed state.
-                d = last_good_d;
-                fp.W = last_good_W;
-                fp.H = last_good_H;
-            } else {
-                // No good snap seen yet — fall back to pre-loop state, snap once, and route.
-                d = pre_snap_d;
-                fp.W = pre_snap_W;
-                fp.H = pre_snap_H;
-                finalize_output();
-                GlobalRouter grf;
-                grf.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
-                grf.route_all(d, 20);
-            }
-            break;
+    // Full validity: every block inside the (compact) outline AND non-overlapping.
+    // Any violation here would be an evaluator FAIL, so such layouts are never kept.
+    auto is_valid = [&]() {
+        double W = d.outline.cur_width, H = d.outline.cur_height;
+        if (W > d.outline.max_width + 1e-3 || H > d.outline.max_height + 1e-3) return false;
+        for (auto& b : d.blocks) {
+            if (b.lx < -1e-3 || b.ly < -1e-3 ||
+                b.lx + b.width  > W + 1e-3 ||
+                b.ly + b.height > H + 1e-3) return false;
         }
+        return !has_overlap();
+    };
 
-        GlobalRouter grs;
-        grs.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
-        grs.route_all(d, 20);
-
+    // Penalty-aware score for ranking valid candidates: real contest cost plus a
+    // heavy term per channel-overflow / feedthrough-overflow so the search drives
+    // those penalties to zero before optimizing area+HPWL.
+    const double PEN = 1e7;
+    auto route_and_score = [&]() {
+        GlobalRouter gr;
+        gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
+        gr.route_all(d, 20);
         collect_ft();
 
-        // Save this iteration as last known-good (valid snap + valid paths).
-        last_good_d = d;
-        last_good_W = fp.W;
-        last_good_H = fp.H;
-        snap_has_good = true;
+        int pen = 0;
+        for (auto& ch : d.channels) {
+            if (ch.nets_x > ch.cap_x() + 1e-3) pen++;
+            if (ch.nets_y > ch.cap_y() + 1e-3) pen++;
+        }
+        for (int i = 0; i < (int)d.blocks.size(); i++) {
+            if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
+            double required = d.blocks[i].get_target_area(fp.ft_nets[i]);
+            if (fp.W[i] * fp.H[i] < required - 1.0) pen++;
+        }
+        return compute_final_cost(d) + PEN * pen;
+    };
+
+    // ── Robust FT convergence ───────────────────────────────────────────────
+    // Each round: (re)snap + route the current layout; if it is fully valid, keep
+    // it as a candidate (best score wins).  Then, if any soft block is undersized
+    // for the observed feedthrough, expand and repack for another round.  Because
+    // only valid layouts are ever recorded, the returned solution can never be an
+    // evaluator FAIL — at worst it carries some channel/FT penalties.
+    Design best_d; std::vector<double> best_W, best_H;
+    double best_score = 1e18; bool have_best = false;
+
+    for (int ft_iter = 0; ft_iter <= 8; ft_iter++) {
+        finalize_output();           // pack + snap edge blocks + channels
+        if (!is_valid()) break;      // expansion broke the fit; keep best-so-far
+
+        double s = route_and_score();
+        if (s < best_score) {
+            best_score = s; best_d = d; best_W = fp.W; best_H = fp.H; have_best = true;
+        }
 
         bool needs_expand = false;
         for (int i = 0; i < (int)d.blocks.size(); i++) {
@@ -233,14 +203,51 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         }
         if (!needs_expand) break;
 
-        fp.apply_ft_areas(false);
+        fp.apply_ft_areas(false);    // grow undersized soft blocks for next round
     }
 
-    double cost = compute_final_cost(d);
-    for (auto& ch : d.channels) if (ch.overflowed()) cost += 1e9;
+    if (have_best) {
+        d = best_d; fp.W = best_W; fp.H = best_H;
+    } else {
+        // Emergency fallback: no expanded layout was valid.  Shrink soft blocks
+        // back to base area (most compact) and emit a clean snapped+routed layout.
+        std::fill(fp.ft_nets.begin(), fp.ft_nets.end(), 0);
+        fp.apply_ft_areas(true);
+        finalize_output();
+        GlobalRouter gr;
+        gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
+        gr.route_all(d, 20);
+        best_score = route_and_score();
+    }
 
     d_in = d;
-    return cost;
+
+    // Validity gate: an out-of-bounds/overlapping layout is an evaluator FAIL.
+    // Return a prohibitive-but-discriminating cost (base 1e15 plus the total
+    // boundary/overlap violation) so that (a) any valid layout always wins, and
+    // (b) among invalid layouts the *least-bad* one is kept — never the trivial
+    // all-at-origin input design.
+    if (!is_valid()) {
+        double Wc = d.outline.cur_width, Hc = d.outline.cur_height;
+        double viol = 0.0;
+        int nb = (int)d.blocks.size();
+        for (auto& b : d.blocks) {
+            if (b.lx < 0) viol += -b.lx;
+            if (b.ly < 0) viol += -b.ly;
+            if (b.lx + b.width  > Wc) viol += b.lx + b.width  - Wc;
+            if (b.ly + b.height > Hc) viol += b.ly + b.height - Hc;
+        }
+        for (int i = 0; i < nb; i++)
+            for (int j = i + 1; j < nb; j++) {
+                double ox = std::min(d.blocks[i].lx + d.blocks[i].width,  d.blocks[j].lx + d.blocks[j].width)
+                          - std::max(d.blocks[i].lx, d.blocks[j].lx);
+                double oy = std::min(d.blocks[i].ly + d.blocks[i].height, d.blocks[j].ly + d.blocks[j].height)
+                          - std::max(d.blocks[i].ly, d.blocks[j].ly);
+                if (ox > 0 && oy > 0) viol += ox + oy;
+            }
+        return 1e15 + viol;
+    }
+    return best_score;
 }
 
 static unsigned mix_seed(unsigned base, unsigned idx) {

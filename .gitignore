@@ -77,3 +77,6 @@ Testing/
 *.log
 input/
 output/
+
+.pyc
+__pycache__/

@@ -46,6 +46,10 @@ public:
     std::vector<double> ch_penalty;
     int n_blocks = 0;
 
+    // Cost multiplier for routing through a SOFT block (feedthrough).  > 1 so the
+    // router prefers channels; feedthrough is used only when unavoidable.
+    static constexpr double FT_TRAVERSE_PENALTY = 3.0;
+
     std::unordered_map<std::string, int> name_to_idx;
 
     void init(const std::vector<Block>& blocks,
@@ -95,6 +99,13 @@ public:
                         int ci = i - n_blocks;
                         if (ci >= 0 && ci < (int)ch_penalty.size())
                             cost *= ch_penalty[ci];
+                    } else {
+                        // Feeding through a SOFT block is expensive: it forces the
+                        // module to grow (FT area conversion).  Charge a heavy
+                        // multiplier so the router prefers routing AROUND through
+                        // channels, and only feeds through as a last resort when
+                        // no channel path exists.
+                        cost *= FT_TRAVERSE_PENALTY;
                     }
                     adj[face_enter(i, ein)].push_back({face_exit(i, eout), cost});
                 }

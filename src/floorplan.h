@@ -1,16 +1,26 @@
 #pragma once
 #include "types.h"
-#include "sequence_pair.h"
+#include "bstree.h"
 #include "channel.h"
+#include "ft_estimator.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>
 #include <numeric>
 
+// Floorplan built on a B*-Tree representation (replaces Sequence Pair).
+// Public surface kept identical to the previous version so main.cpp and the
+// output/channel pipeline are unaffected:
+//   W, H, ft_nets, active_loc, edge_block_idx
+//   pack() / eval() / commit()
+//   apply_ft_areas(bool) / finalize_edge_blocks(max_w,max_h)
+//   compute_cost(...) / compute_hpwl() / edge_block_penalty(...)
+//   flip_location(i)
+
 class Floorplan {
 public:
     Design& d;
-    SequencePair sp;
+    BStarTree bst;
 
     std::vector<double> W, H;
     std::vector<bool> rotatable;
@@ -18,11 +28,24 @@ public:
     std::vector<int> active_loc;
     std::vector<int> edge_block_idx;
 
-    Floorplan(Design& d_) : d(d_), sp((int)d_.blocks.size()),
+    // Cost normalization (set by the SA from sampling).  A well-conditioned
+    // normalized cost is what makes the fixed-outline constraint actually
+    // converge for large block counts (cf. the PA2 B*-tree floorplanner).
+    double Anorm = 1.0;   // average sampled chip area
+    double Wnorm = 1.0;   // average sampled HPWL
+    double Fnorm = 1.0;   // average sampled feedthrough estimate
+    double gamma = 100.0; // outline-violation weight (PA2 uses 100)
+    double ftw   = 0.0;   // feedthrough penalty weight (0 until SA enables it)
+
+    // padded scratch for HALO evaluation (reused, no per-eval alloc)
+    std::vector<double> pad_W, pad_H;
+
+    Floorplan(Design& d_) : d(d_), bst((int)d_.blocks.size()),
         W(d_.blocks.size()), H(d_.blocks.size()),
         rotatable(d_.blocks.size(), false),
         ft_nets(d_.blocks.size(), 0),
-        active_loc(d_.blocks.size(), 0) {
+        active_loc(d_.blocks.size(), 0),
+        pad_W(d_.blocks.size()), pad_H(d_.blocks.size()) {
         for (int i = 0; i < (int)d.blocks.size(); i++) {
             W[i] = d.blocks[i].width;
             H[i] = d.blocks[i].height;
@@ -39,6 +62,7 @@ public:
         active_loc[i] = (active_loc[i] + 1) % nlocs;
     }
 
+    // Resize SOFT blocks to satisfy the (estimated) feedthrough area requirement.
     void apply_ft_areas(bool reset_zero = true) {
         for (int i = 0; i < (int)d.blocks.size(); i++) {
             if (d.blocks[i].type != BlockType::SOFT) continue;
@@ -67,81 +91,59 @@ public:
         }
     }
 
-    // 評估時強制加入 2.0um 的 Halo，保證 Block 之間絕對會產生可繞線的 Channel
+    // Evaluate packing with a 2.0um HALO around every block so a routable
+    // channel is always guaranteed between neighbors.  Does NOT commit.
     std::pair<double,double> eval() {
         const double HALO = 2.0;
-        std::vector<double> pad_W = W, pad_H = H;
-        for(size_t i=0; i<W.size(); i++) { pad_W[i] += HALO; pad_H[i] += HALO; }
-        return sp.evaluate(pad_W, pad_H);
+        for (size_t i = 0; i < W.size(); i++) { pad_W[i] = W[i] + HALO; pad_H[i] = H[i] + HALO; }
+        return bst.pack(pad_W, pad_H);
     }
 
     std::pair<double,double> pack() {
-        auto [tw, th] = eval();
+        auto r = eval();
         commit();
-        return {tw, th};
+        return r;
     }
 
     void commit() {
         for (int i = 0; i < (int)d.blocks.size(); i++) {
-            d.blocks[i].lx = sp.x[i];
-            d.blocks[i].ly = sp.y[i];
+            d.blocks[i].lx = bst.x[i];
+            d.blocks[i].ly = bst.y[i];
             d.blocks[i].width  = W[i];
             d.blocks[i].height = H[i];
         }
     }
 
-    // 最後定案時，將 Edge Block 強制貼齊大會設定的 MAX OUTLINE
+    // Snap edge blocks to the requested boundary (compact chip outline),
+    // overlap-safely: a block is moved to its boundary only if the snapped
+    // position does not collide with any other block.  Otherwise it keeps its
+    // packed position.  This prevents snap-induced overlap FAILs when the edge
+    // constraints are over-subscribed (e.g. two blocks both requiring the same
+    // corner) — at worst one edge constraint is left unsatisfied rather than
+    // producing a cascade of overlaps.
     void finalize_edge_blocks(double max_w, double max_h) {
+        int nb = (int)d.blocks.size();
         for (int i : edge_block_idx) {
             auto& b = d.blocks[i];
             int li = std::min(active_loc[i], (int)b.locations.size() - 1);
             const std::string& loc = b.locations[li];
-            if (loc.find('T') != std::string::npos) b.ly = max_h - b.height;
-            if (loc.find('B') != std::string::npos) b.ly = 0.0;
-            if (loc.find('L') != std::string::npos) b.lx = 0.0;
-            if (loc.find('R') != std::string::npos) b.lx = max_w - b.width;
-        }
-    }
 
-    // Push edge blocks to extreme positions in the sequence pair so that
-    // finalize_edge_blocks() never creates block overlaps.  The rules are:
-    //   'B' (bottom snap) → first in gp, last in gm  → block is packed at y=0
-    //   'T' (top snap)    → last  in gp, first in gm → block is packed at y=max
-    //   'L' only          → first in both gp and gm  → block is packed at x=0
-    //   'R' only          → last  in both gp and gm  → block is packed at x=max
-    // After the snap, all non-edge blocks are strictly inside the snapped
-    // edge block's zone (guaranteed by the HALO gap in the sequence-pair packing).
-    void enforce_edge_block_extremes() {
-        auto move_to_front = [](std::vector<int>& v, int val) {
-            auto it = std::find(v.begin(), v.end(), val);
-            if (it != v.begin()) std::rotate(v.begin(), it, it + 1);
-        };
-        auto move_to_back = [](std::vector<int>& v, int val) {
-            auto it = std::find(v.begin(), v.end(), val);
-            if (it != v.end() - 1) std::rotate(it, it + 1, v.end());
-        };
+            double ox = b.lx, oy = b.ly, nx = b.lx, ny = b.ly;
+            if (loc.find('T') != std::string::npos) ny = max_h - b.height;
+            if (loc.find('B') != std::string::npos) ny = 0.0;
+            if (loc.find('L') != std::string::npos) nx = 0.0;
+            if (loc.find('R') != std::string::npos) nx = max_w - b.width;
 
-        for (int i : edge_block_idx) {
-            int li = std::min(active_loc[i], (int)d.blocks[i].locations.size() - 1);
-            const std::string& loc = d.blocks[i].locations[li];
-            bool has_B = (loc.find('B') != std::string::npos);
-            bool has_T = (loc.find('T') != std::string::npos);
-            bool has_L = (loc.find('L') != std::string::npos);
-            bool has_R = (loc.find('R') != std::string::npos);
-
-            if (has_B) {
-                move_to_front(sp.gp, i);
-                move_to_back (sp.gm, i);
-            } else if (has_T) {
-                move_to_back (sp.gp, i);
-                move_to_front(sp.gm, i);
-            } else if (has_L) {
-                move_to_front(sp.gp, i);
-                move_to_front(sp.gm, i);
-            } else if (has_R) {
-                move_to_back (sp.gp, i);
-                move_to_back (sp.gm, i);
+            b.lx = nx; b.ly = ny;
+            bool collide = false;
+            for (int j = 0; j < nb && !collide; j++) {
+                if (j == i) continue;
+                const auto& o = d.blocks[j];
+                double cx = std::min(b.lx + b.width,  o.lx + o.width)  - std::max(b.lx, o.lx);
+                double cy = std::min(b.ly + b.height, o.ly + o.height) - std::max(b.ly, o.ly);
+                if (cx > 0.01 && cy > 0.01) collide = true;
             }
+            if (collide) { b.lx = ox; b.ly = oy; } // keep packed position
         }
     }
 
@@ -149,51 +151,68 @@ public:
         double total = 0;
         for (auto& conn : d.connections) {
             int a = conn.from, b = conn.to;
-            double cx_a = sp.x[a] + W[a] * 0.5, cy_a = sp.y[a] + H[a] * 0.5;
-            double cx_b = sp.x[b] + W[b] * 0.5, cy_b = sp.y[b] + H[b] * 0.5;
+            double cx_a = bst.x[a] + W[a] * 0.5, cy_a = bst.y[a] + H[a] * 0.5;
+            double cx_b = bst.x[b] + W[b] * 0.5, cy_b = bst.y[b] + H[b] * 0.5;
             total += conn.nets * (std::abs(cx_b - cx_a) + std::abs(cy_b - cy_a));
         }
         return total;
     }
 
+    // Normalized SA cost (PA2-style): area and HPWL are scaled by their sampled
+    // averages so all terms are O(1); the fixed outline is enforced by a strong
+    // normalized violation penalty (gamma).  The true contest metric
+    // (area + alpha*HPWL) is still used for final solution ranking in main.
     double compute_cost(double chip_w, double chip_h, double alpha, double max_w, double max_h) const {
-        double cost = (chip_w * chip_h) + alpha * compute_hpwl();
-        if (chip_w > max_w) cost += 1e8 * (chip_w - max_w);
-        if (chip_h > max_h) cost += 1e8 * (chip_h - max_h);
-        cost += edge_block_penalty(chip_w, chip_h); // push edge blocks to actual chip boundary
-        return cost;
+        double area = chip_w * chip_h;
+        double base = area / Anorm + alpha * (compute_hpwl() / Wnorm);
+
+        double wv = std::max(0.0, chip_w - max_w) / max_w;
+        double hv = std::max(0.0, chip_h - max_h) / max_h;
+        double penalty = gamma * (wv + hv);
+
+        if (ftw > 0.0) {
+            double ft = ftest::cost(d.blocks, d.connections, bst.x, bst.y, W, H);
+            penalty += ftw * (ft / Fnorm);
+        }
+
+        penalty += edge_block_penalty(max_w, max_h);
+        return base + penalty;
     }
 
+    // Penalise edge blocks for not being at the chip boundary, plus a collision
+    // term for the projected snap (so the SA avoids snaps that would overlap).
+    // Normalized to the same O(1) scale as the base cost.
     double edge_block_penalty(double max_w, double max_h) const {
         double penalty = 0;
-        const double DIST_W = 50.0;
-        const double OVERLAP_W = 1e6;
+        const double W_DIST = 5.0;     // mild pull toward the boundary
+        const double W_OVL  = 200.0;   // projected snap overlap is a hard FAIL -> heavy
+                                       // (per-pair fixed term keeps even tiny
+                                       //  overlaps in the hard-constraint tier)
 
-        int n = d.blocks.size();
+        int n = (int)d.blocks.size();
         std::vector<double> sx(n), sy(n);
-        for (int i = 0; i < n; i++) { sx[i] = sp.x[i]; sy[i] = sp.y[i]; }
+        for (int i = 0; i < n; i++) { sx[i] = bst.x[i]; sy[i] = bst.y[i]; }
 
-        // 預判將 Edge Block 推向 MAX 邊緣
         for (int i : edge_block_idx) {
             int li = std::min(active_loc[i], (int)d.blocks[i].locations.size() - 1);
             const std::string& loc = d.blocks[i].locations[li];
-            
+
             if (loc.find('T') != std::string::npos) sy[i] = max_h - H[i];
             if (loc.find('B') != std::string::npos) sy[i] = 0.0;
             if (loc.find('L') != std::string::npos) sx[i] = 0.0;
             if (loc.find('R') != std::string::npos) sx[i] = max_w - W[i];
 
-            penalty += DIST_W * (std::abs(sx[i] - sp.x[i]) + std::abs(sy[i] - sp.y[i]));
+            penalty += W_DIST * (std::abs(sx[i] - bst.x[i]) / max_w +
+                                 std::abs(sy[i] - bst.y[i]) / max_h);
         }
 
-        // 碰撞測試：確保推到邊緣後，不會跟其他 Block 撞在一起
         for (int i : edge_block_idx) {
             for (int j = 0; j < n; j++) {
                 if (i == j) continue;
                 if (d.blocks[j].type == BlockType::EDGE && i >= j) continue;
                 double ox = std::min(sx[i] + W[i], sx[j] + W[j]) - std::max(sx[i], sx[j]);
                 double oy = std::min(sy[i] + H[i], sy[j] + H[j]) - std::max(sy[i], sy[j]);
-                if (ox > 1e-6 && oy > 1e-6) penalty += OVERLAP_W * (ox * oy);
+                if (ox > 1e-6 && oy > 1e-6) penalty += W_OVL * (1.0 + (ox * oy) / Anorm);
             }
         }
         return penalty;
