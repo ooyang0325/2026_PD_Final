@@ -4,6 +4,8 @@
 #include "channel.h"
 #include "router.h"
 #include "sa_optimizer.h"
+#include "legalize_loop.h"
+#include "analytical_legalizer.h"
 #include "output.h"
 #include "config.h"
 #include <iostream>
@@ -189,8 +191,14 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
     // score counts overflows (heavily) then breaks ties by the proportional
     // overflow magnitude and finally the real contest cost (area + alpha*HPWL).
     // Edge-constraint FAILs are weighted above everything (a FAIL disqualifies).
-    const double FAILW = 1e15;  // per edge-constraint FAIL
-    const double PEN   = 1e7;   // per overflow (count)
+    // Lexicographic priority: edge-FAIL > overflow penalty > cost.  FAILW must
+    // dominate any sum of penalties; PEN must dominate any cost (area + α·HPWL)
+    // change so a transition that trades cost for a penalty reduction always
+    // wins.  Real cases: cost ~1e9, ~100 overflows max → PEN=1e10 gives a
+    // single penalty (1e10) > any plausible cost swing; ~1000 max penalties
+    // (1e13) << FAILW=1e15, so 1 FAIL still beats every overflow combined.
+    const double FAILW = 1e15;
+    const double PEN   = 1e10;
     auto route_and_score = [&]() {
         GlobalRouter gr;
         gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
@@ -212,38 +220,118 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         return compute_final_cost(d) + FAILW * count_edge_fails() + PEN * pen + mag;
     };
 
-    // ── Robust FT convergence ───────────────────────────────────────────────
-    // Each round: (re)snap + route the current layout; if it is fully valid keep
-    // it as a candidate (best score wins).  Then, if any soft block is undersized
-    // for the observed feedthrough, expand and repack for another round.  Only
-    // valid layouts are ever recorded, so the result can never be an evaluator
-    // FAIL — at worst it carries some channel/feedthrough penalties.
-    Design best_d; std::vector<double> best_W, best_H;
-    double best_score = 1e18; bool have_best = false;
+    // ── Route-driven legalize loop ──────────────────────────────────────────
+    // Replaces the legacy global-expand ft_iter loop with a hotspot-targeted
+    // action cascade (rotate → displace → expand) under strict rollback.  The
+    // loop never returns a worse layout than it was given, so the worst case
+    // here is identical to "just take the SA output as-is."
+    double best_score = 1e18;
+    bool have_best = false;
 
-    for (int ft_iter = 0; ft_iter <= 8; ft_iter++) {
+    if (cfg::LEG_ENABLE) {
         finalize_output();
-        if (!is_valid()) break;
-
-        double s = route_and_score();
-        if (s < best_score) {
-            best_score = s; best_d = d; best_W = fp.W; best_H = fp.H; have_best = true;
+        if (is_valid()) {
+            LegalizeLoop loop(fp, d,
+                              /*finalize=*/ finalize_output,
+                              /*score   =*/ route_and_score,
+                              /*is_valid=*/ is_valid,
+                              seed1 ^ 0xACE5EEDu);
+            loop.max_iters      = cfg::LEG_ITERS;
+            loop.max_seconds    = cfg::LEG_TIME;
+            loop.displace_tries = cfg::LEG_TRIES;
+            best_score = loop.run();
+            have_best  = is_valid();
         }
 
-        bool needs_expand = false;
-        for (int i = 0; i < (int)d.blocks.size(); i++) {
-            if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
-            double required = d.blocks[i].get_target_area(fp.ft_nets[i]);
-            if (fp.W[i] * fp.H[i] < required - 1.0) { needs_expand = true; break; }
-        }
-        if (!needs_expand) break;
+        // ── Final-pass analytical legalizer ──────────────────────────────────
+        // Force-directed redistribution within the current compact outline.
+        // Breaks the B*-tree by design (user-approved): operates directly on
+        // (lx, ly) coordinates.  Strict rollback if it doesn't improve.
+        if (have_best && cfg::ANA_ENABLE) {
+            // Snapshot the full pre-analytical state.
+            auto snap_bst    = fp.bst.save();
+            auto snap_W      = fp.W;
+            auto snap_H      = fp.H;
+            auto snap_loc    = fp.active_loc;
+            auto snap_ft     = fp.ft_nets;
+            auto snap_blocks = d.blocks;
+            auto snap_chs    = d.channels;
+            auto snap_paths  = d.paths;
+            auto snap_outl   = d.outline;
+            double snap_score = best_score;
 
-        fp.apply_ft_areas(false);
+            // Run the analytical pass.  It only mutates d.blocks[i].lx/ly for
+            // non-pinned blocks (and ONLY clips within d.outline.cur_*).
+            AnalyticalLegalizer ana(fp, d);
+            ana.iterations = cfg::ANA_ITERS;
+            ana.step_frac  = cfg::ANA_STEP;
+            ana.repel_w    = cfg::ANA_REPEL;
+            bool moved = ana.run();
+
+            if (moved) {
+                // Recompute channels from the new coords WITHOUT B*-tree pack
+                // (the tree is now stale; coords are authoritative).  Outline
+                // stays at the pre-analytical compact value — the legalizer
+                // clipped within it so the max extent fits.
+                d.channels = ChannelCalculator::compute(
+                    d.blocks, d.outline.cur_width, d.outline.cur_height);
+
+                if (is_valid()) {
+                    double new_score = route_and_score();
+                    if (new_score < snap_score - 1.0) {
+                        best_score = new_score; // accept
+                    } else {
+                        // Rollback — analytical didn't help.
+                        fp.bst.restore(snap_bst);
+                        fp.W = snap_W; fp.H = snap_H;
+                        fp.active_loc = snap_loc;
+                        fp.ft_nets = snap_ft;
+                        d.blocks = snap_blocks;
+                        d.channels = snap_chs;
+                        d.paths = snap_paths;
+                        d.outline = snap_outl;
+                    }
+                } else {
+                    // Invalid layout (overlap left after MTV resolution, or
+                    // out-of-outline) — rollback.
+                    fp.bst.restore(snap_bst);
+                    fp.W = snap_W; fp.H = snap_H;
+                    fp.active_loc = snap_loc;
+                    fp.ft_nets = snap_ft;
+                    d.blocks = snap_blocks;
+                    d.channels = snap_chs;
+                    d.paths = snap_paths;
+                    d.outline = snap_outl;
+                }
+            }
+        }
+    } else {
+        // Legacy global-expand convergence (kept for A/B testing via FP_LEG_ENABLE=0).
+        // Records best valid state across rounds so an expansion that overshoots
+        // doesn't leave d/fp in a worse state than an earlier round.
+        Design best_d;
+        std::vector<double> best_W, best_H;
+        for (int ft_iter = 0; ft_iter <= 8; ft_iter++) {
+            finalize_output();
+            if (!is_valid()) break;
+            double s = route_and_score();
+            if (s < best_score) {
+                best_score = s; best_d = d; best_W = fp.W; best_H = fp.H;
+                have_best = true;
+            }
+            bool needs_expand = false;
+            for (int i = 0; i < (int)d.blocks.size(); i++) {
+                if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
+                double required = d.blocks[i].get_target_area(fp.ft_nets[i]);
+                if (fp.W[i] * fp.H[i] < required - 1.0) { needs_expand = true; break; }
+            }
+            if (!needs_expand) break;
+            fp.apply_ft_areas(false);
+        }
+        if (have_best) { d = best_d; fp.W = best_W; fp.H = best_H; }
     }
 
-    if (have_best) {
-        d = best_d; fp.W = best_W; fp.H = best_H;
-    } else {
+    if (!have_best) {
         // Emergency fallback: nothing valid — base area, clean snapped + routed.
         std::fill(fp.ft_nets.begin(), fp.ft_nets.end(), 0);
         fp.apply_ft_areas(true);
