@@ -122,39 +122,29 @@ public:
         return adj;
     }
 
-    // Rip-up and reroute: iteratively increase penalty for overflowed channels.
-    bool route_all(Design& d, int max_rr = 8) {
-        for (auto& ch : d.channels) {
-            const_cast<Channel&>(ch).nets_x = 0;
-            const_cast<Channel&>(ch).nets_y = 0;
-        }
-        d.paths.clear();
+    // A routing demand (a connection, or a split fragment of one).
+    struct Demand { int from, to; long nets; };
 
-        std::vector<int> order(d.connections.size());
+    // One rip-up/reroute episode over a fixed set of demands.  Routes each demand
+    // on a single shortest path; the returned paths are aligned to `dems`.
+    bool ripup_route(Design& d, const std::vector<Demand>& dems,
+                     std::vector<RoutePath>& dem_paths, int max_rr) {
+        std::fill(ch_penalty.begin(), ch_penalty.end(), 1.0);
+        std::vector<int> order(dems.size());
         std::iota(order.begin(), order.end(), 0);
-        std::sort(order.begin(), order.end(), [&](int a, int b){
-            return d.connections[a].nets > d.connections[b].nets;
-        });
+        std::sort(order.begin(), order.end(), [&](int a, int b){ return dems[a].nets > dems[b].nets; });
 
         bool all_ok = false;
         for (int rr = 0; rr <= max_rr; rr++) {
             auto adj = build_adj();
-            d.paths.clear();
-            for (auto& ch : d.channels) {
-                const_cast<Channel&>(ch).nets_x = 0;
-                const_cast<Channel&>(ch).nets_y = 0;
-            }
+            for (auto& ch : d.channels) { ch.nets_x = 0; ch.nets_y = 0; }
+            dem_paths.assign(dems.size(), RoutePath{});
             all_ok = true;
 
-            for (int ci : order) {
-                auto& conn = d.connections[ci];
-                auto path = route_one(conn.from, conn.to, conn.nets, adj, d);
-                if (path.segments.empty()) {
-                    all_ok = false;
-                } else {
-                    accum_nets(path, conn.nets, d);
-                    d.paths.push_back(path);
-                }
+            for (int k : order) {
+                auto path = route_one(dems[k].from, dems[k].to, (int)dems[k].nets, adj, d);
+                if (path.segments.empty()) all_ok = false;
+                else { accum_nets(path, (int)dems[k].nets, d); dem_paths[k] = path; }
             }
 
             bool overflow = false;
@@ -167,6 +157,77 @@ public:
             if (!overflow && all_ok) break;
         }
         return all_ok;
+    }
+
+    static double total_overflow(const Design& d) {
+        double o = 0;
+        for (auto& ch : d.channels) {
+            o += std::max(0.0, ch.nets_x - ch.cap_x());
+            o += std::max(0.0, ch.nets_y - ch.cap_y());
+        }
+        return o;
+    }
+
+    // Hybrid net splitting (per the official Q&A: a connection's demand may be
+    // split across multiple paths).  Round 0 routes every connection on a single
+    // path (identical to the plain rip-up router).  After each round, any demand
+    // whose path crosses an over-capacity channel is split in half into two
+    // demands and the set is re-routed; the lowest-total-overflow result across
+    // all rounds is kept.  Splitting therefore only ever happens for connections
+    // involved in an overflow, and can never make the result worse than the
+    // single-path solution (round 0 is always a candidate).
+    bool route_all(Design& d, int max_rr = 8) {
+        std::vector<Demand> dems;
+        dems.reserve(d.connections.size());
+        for (auto& c : d.connections) dems.push_back({c.from, c.to, (long)c.nets});
+
+        const int MAX_ROUNDS = 6;
+        std::vector<RoutePath> best_paths;
+        double best_ovf = 1e30;
+        bool best_ok = false;
+
+        std::vector<RoutePath> dem_paths;
+        for (int round = 0; round < MAX_ROUNDS; round++) {
+            bool ok = ripup_route(d, dems, dem_paths, max_rr);
+            double ovf = total_overflow(d);
+            if (ovf < best_ovf - 1e-6) {
+                best_ovf = ovf;
+                best_paths.clear();
+                for (auto& p : dem_paths) if (!p.segments.empty()) best_paths.push_back(p);
+                best_ok = ok;
+            }
+            if (ovf < 1e-6) break;
+
+            // Split demands whose path crosses an over-capacity channel.
+            std::set<std::string> over;
+            for (auto& ch : d.channels) if (ch.overflowed()) over.insert(ch.name);
+
+            std::vector<Demand> next;
+            next.reserve(dems.size() * 2);
+            bool split_any = false;
+            for (size_t k = 0; k < dems.size(); k++) {
+                bool crosses = false;
+                if (dems[k].nets > 1)
+                    for (auto& seg : dem_paths[k].segments)
+                        if (over.count(seg.rect_name)) { crosses = true; break; }
+                if (crosses) {
+                    long h = dems[k].nets / 2;
+                    next.push_back({dems[k].from, dems[k].to, h});
+                    next.push_back({dems[k].from, dems[k].to, dems[k].nets - h});
+                    split_any = true;
+                } else {
+                    next.push_back(dems[k]);
+                }
+            }
+            if (!split_any) break;
+            dems.swap(next);
+        }
+
+        // Adopt the best-overflow routing and recompute channel usage from it.
+        d.paths = best_paths;
+        for (auto& ch : d.channels) { ch.nets_x = 0; ch.nets_y = 0; }
+        for (auto& p : d.paths) accum_nets(p, p.nets, d);
+        return best_ok;
     }
 
     // Dijkstra over face-graph; targets any entry face of destination.

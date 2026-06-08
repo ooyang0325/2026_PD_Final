@@ -1,6 +1,7 @@
 #pragma once
 #include "floorplan.h"
 #include "ft_estimator.h"
+#include "config.h"
 #include "channel.h"
 #include <random>
 #include <cmath>
@@ -81,7 +82,7 @@ public:
             fp.Anorm = std::max(1.0, sumA / samples);
             fp.Wnorm = std::max(1.0, sumW / samples);
             fp.Fnorm = std::max(1.0, sumF / samples);
-            fp.ftw   = 0.4; // feedthrough-minimizing penalty: pack connected blocks adjacent
+            fp.ftw   = cfg::FTW; // feedthrough-minimizing penalty: pack connected blocks adjacent
 
             // Average uphill step of the FULL normalized cost INCLUDING the outline
             // violation term (gamma).  Calibrating the temperature to area+HPWL only

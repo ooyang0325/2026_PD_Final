@@ -3,6 +3,7 @@
 #include "bstree.h"
 #include "channel.h"
 #include "ft_estimator.h"
+#include "config.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -94,7 +95,7 @@ public:
     // Evaluate packing with a 2.0um HALO around every block so a routable
     // channel is always guaranteed between neighbors.  Does NOT commit.
     std::pair<double,double> eval() {
-        const double HALO = 2.0;
+        const double HALO = cfg::HALO;
         for (size_t i = 0; i < W.size(); i++) { pad_W[i] = W[i] + HALO; pad_H[i] = H[i] + HALO; }
         return bst.pack(pad_W, pad_H);
     }
@@ -158,6 +159,25 @@ public:
         return total;
     }
 
+    // Routing-aware placement term: only HIGH-demand connections (those liable to
+    // overflow a single channel) contribute, weighted by how much they exceed the
+    // threshold times their separation.  Minimizing this pulls heavily-connected
+    // blocks adjacent so their connecting channel is wide (high capacity) and the
+    // net does not have to feed through / congest narrow channels — cutting both
+    // channel and feedthrough overflow at the source.  O(#connections).
+    double compute_congestion() const {
+        double total = 0;
+        for (auto& conn : d.connections) {
+            double excess = conn.nets - cfg::PCONG_THRESH;
+            if (excess <= 0) continue;
+            int a = conn.from, b = conn.to;
+            double cx_a = bst.x[a] + W[a] * 0.5, cy_a = bst.y[a] + H[a] * 0.5;
+            double cx_b = bst.x[b] + W[b] * 0.5, cy_b = bst.y[b] + H[b] * 0.5;
+            total += excess * (std::abs(cx_b - cx_a) + std::abs(cy_b - cy_a));
+        }
+        return total;
+    }
+
     // Normalized SA cost (PA2-style): area and HPWL are scaled by their sampled
     // averages so all terms are O(1); the fixed outline is enforced by a strong
     // normalized violation penalty (gamma).  The true contest metric
@@ -174,6 +194,10 @@ public:
             double ft = ftest::cost(d.blocks, d.connections, bst.x, bst.y, W, H);
             penalty += ftw * (ft / Fnorm);
         }
+
+        // Routing-aware: keep high-demand pairs close (wide connecting channel).
+        if (cfg::PCONGW > 0.0)
+            penalty += cfg::PCONGW * (compute_congestion() / Wnorm);
 
         penalty += edge_block_penalty(max_w, max_h);
         return base + penalty;

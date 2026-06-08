@@ -5,6 +5,7 @@
 #include "router.h"
 #include "sa_optimizer.h"
 #include "output.h"
+#include "config.h"
 #include <iostream>
 #include <string>
 #include <chrono>
@@ -110,6 +111,12 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         }
     };
 
+    auto route_now = [&]() {
+        GlobalRouter gr;
+        gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
+        gr.route_all(d, 20);
+    };
+
     // ── SA phase 1 ──────────────────────────────────────────────────────────
     SAOptimizer sa(fp, seed1);
     sa.time_limit_sec = sa1_time;
@@ -117,8 +124,8 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
     finalize_output();
 
     // ── SA phase 2 (fine) ───────────────────────────────────────────────────
-    // No FT pre-expansion: pack at base area to satisfy the fixed outline; the
-    // convergence loop below sizes soft blocks to the real feedthrough.
+    // Pack at base area to satisfy the fixed outline; the convergence loop below
+    // sizes soft blocks to the real feedthrough.
     SAOptimizer sa2(fp, seed2);
     sa2.time_limit_sec = sa2_time;
     sa2.run();
@@ -154,10 +161,36 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         return !has_overlap();
     };
 
-    // Penalty-aware score for ranking valid candidates: real contest cost plus a
-    // heavy term per channel-overflow / feedthrough-overflow so the search drives
-    // those penalties to zero before optimizing area+HPWL.
-    const double PEN = 1e7;
+    // Count edge blocks not sitting at their required boundary (each is an
+    // evaluator FAIL).  The overlap-safe snap may leave a block unsnapped when
+    // snapping it would collide; and FT expansion can shift the packing so an
+    // edge block no longer reaches its corner.  Mirrors evaluator.check_edge_location.
+    auto count_edge_fails = [&]() {
+        int fails = 0;
+        double W = d.outline.cur_width, H = d.outline.cur_height;
+        for (int i : fp.edge_block_idx) {
+            const auto& b = d.blocks[i];
+            bool ok = false;
+            for (const auto& loc : b.locations) {
+                bool m = true;
+                if (loc.find('T') != std::string::npos && std::abs(b.ly + b.height - H) > 1e-3) m = false;
+                if (loc.find('B') != std::string::npos && std::abs(b.ly - 0.0)            > 1e-3) m = false;
+                if (loc.find('L') != std::string::npos && std::abs(b.lx - 0.0)            > 1e-3) m = false;
+                if (loc.find('R') != std::string::npos && std::abs(b.lx + b.width - W)    > 1e-3) m = false;
+                if (m) { ok = true; break; }
+            }
+            if (!ok) fails++;
+        }
+        return fails;
+    };
+
+    // Penalty-aware score for ranking valid candidates.  The provided evaluator
+    // counts each overflowing channel-direction / undersized soft block, so the
+    // score counts overflows (heavily) then breaks ties by the proportional
+    // overflow magnitude and finally the real contest cost (area + alpha*HPWL).
+    // Edge-constraint FAILs are weighted above everything (a FAIL disqualifies).
+    const double FAILW = 1e15;  // per edge-constraint FAIL
+    const double PEN   = 1e7;   // per overflow (count)
     auto route_and_score = [&]() {
         GlobalRouter gr;
         gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
@@ -165,30 +198,32 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         collect_ft();
 
         int pen = 0;
+        double mag = 0.0;
         for (auto& ch : d.channels) {
-            if (ch.nets_x > ch.cap_x() + 1e-3) pen++;
-            if (ch.nets_y > ch.cap_y() + 1e-3) pen++;
+            if (ch.nets_x > ch.cap_x() + 1e-3) { pen++; mag += ch.nets_x - ch.cap_x(); }
+            if (ch.nets_y > ch.cap_y() + 1e-3) { pen++; mag += ch.nets_y - ch.cap_y(); }
         }
         for (int i = 0; i < (int)d.blocks.size(); i++) {
             if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
             double required = d.blocks[i].get_target_area(fp.ft_nets[i]);
-            if (fp.W[i] * fp.H[i] < required - 1.0) pen++;
+            double actual   = fp.W[i] * fp.H[i];
+            if (actual < required - 1.0) { pen++; mag += (required - actual); }
         }
-        return compute_final_cost(d) + PEN * pen;
+        return compute_final_cost(d) + FAILW * count_edge_fails() + PEN * pen + mag;
     };
 
     // ── Robust FT convergence ───────────────────────────────────────────────
-    // Each round: (re)snap + route the current layout; if it is fully valid, keep
+    // Each round: (re)snap + route the current layout; if it is fully valid keep
     // it as a candidate (best score wins).  Then, if any soft block is undersized
-    // for the observed feedthrough, expand and repack for another round.  Because
-    // only valid layouts are ever recorded, the returned solution can never be an
-    // evaluator FAIL — at worst it carries some channel/FT penalties.
+    // for the observed feedthrough, expand and repack for another round.  Only
+    // valid layouts are ever recorded, so the result can never be an evaluator
+    // FAIL — at worst it carries some channel/feedthrough penalties.
     Design best_d; std::vector<double> best_W, best_H;
     double best_score = 1e18; bool have_best = false;
 
     for (int ft_iter = 0; ft_iter <= 8; ft_iter++) {
-        finalize_output();           // pack + snap edge blocks + channels
-        if (!is_valid()) break;      // expansion broke the fit; keep best-so-far
+        finalize_output();
+        if (!is_valid()) break;
 
         double s = route_and_score();
         if (s < best_score) {
@@ -203,20 +238,17 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         }
         if (!needs_expand) break;
 
-        fp.apply_ft_areas(false);    // grow undersized soft blocks for next round
+        fp.apply_ft_areas(false);
     }
 
     if (have_best) {
         d = best_d; fp.W = best_W; fp.H = best_H;
     } else {
-        // Emergency fallback: no expanded layout was valid.  Shrink soft blocks
-        // back to base area (most compact) and emit a clean snapped+routed layout.
+        // Emergency fallback: nothing valid — base area, clean snapped + routed.
         std::fill(fp.ft_nets.begin(), fp.ft_nets.end(), 0);
         fp.apply_ft_areas(true);
         finalize_output();
-        GlobalRouter gr;
-        gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
-        gr.route_all(d, 20);
+        route_now();
         best_score = route_and_score();
     }
 
@@ -305,6 +337,8 @@ int main(int argc, char* argv[]) {
     }
     std::string in_path = argv[1];
     std::string out_path = argv[2];
+
+    cfg::load_from_env();
 
     auto t0 = std::chrono::steady_clock::now();
     auto elapsed = [&]() {

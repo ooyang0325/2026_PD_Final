@@ -5,7 +5,7 @@ TARGER_DIR = bin
 SRCDIR   = src
 
 SRC  = $(SRCDIR)/main.cpp
-HDRS = $(SRCDIR)/types.h $(SRCDIR)/parser.h $(SRCDIR)/bstree.h \
+HDRS = $(SRCDIR)/config.h $(SRCDIR)/types.h $(SRCDIR)/parser.h $(SRCDIR)/bstree.h \
        $(SRCDIR)/ft_estimator.h $(SRCDIR)/channel.h $(SRCDIR)/router.h \
        $(SRCDIR)/floorplan.h $(SRCDIR)/sa_optimizer.h $(SRCDIR)/output.h
 
