@@ -229,6 +229,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
     bool have_best = false;
 
     if (cfg::LEG_ENABLE) {
+        printf("[LegalizeLoop] Starting with score %.3f\n", route_and_score());
         finalize_output();
         if (is_valid()) {
             LegalizeLoop loop(fp, d,
@@ -248,6 +249,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         // Breaks the B*-tree by design (user-approved): operates directly on
         // (lx, ly) coordinates.  Strict rollback if it doesn't improve.
         if (have_best && cfg::ANA_ENABLE) {
+            printf("[Analytical] Starting with score %.3f\n", best_score);
             // Snapshot the full pre-analytical state.
             auto snap_bst    = fp.bst.save();
             auto snap_W      = fp.W;
