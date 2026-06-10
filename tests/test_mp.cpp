@@ -3,6 +3,7 @@
 // Plain asserts — no test framework.  Builds via `make test`.
 
 #include "../src/mp/density.h"
+#include "../src/mp/wa_wirelength.h"
 #include "../src/types.h"
 #include "../src/config.h"
 
@@ -286,6 +287,178 @@ void test_overflow_zero_at_uniform() {
     std::printf("[test_overflow_zero_at_uniform] PASS\n");
 }
 
+// ---- Phase 3 (WA wirelength) tests -----------------------------------------
+
+// FD-check ∂cost/∂x_i and ∂cost/∂y_i against `compute(...).grad_*` within
+// 1e-3 relative tolerance on a 10-block toy with ≥ 8 random 2-pin nets
+// (mt19937 seed 12345).  Two γ values exercise the "loose" and "tight" regime
+// (per plan §3).
+void test_fd_wa_gradient() {
+    std::printf("[test_fd_wa_gradient] start\n");
+
+    Design d;
+    d.outline.max_width  = 1000.0;
+    d.outline.max_height = 1000.0;
+
+    const int N = 10;
+    for (int i = 0; i < N; ++i) {
+        d.blocks.push_back(make_block("b" + std::to_string(i),
+                                      BlockType::SOFT, 50.0, 50.0));
+    }
+
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<double> pos(0.0, 900.0);
+    std::vector<double> x(N), y(N);
+    for (int i = 0; i < N; ++i) { x[i] = pos(rng); y[i] = pos(rng); }
+
+    // ≥ 8 random 2-pin nets, distinct endpoints.
+    std::uniform_int_distribution<int> blk(0, N - 1);
+    std::uniform_int_distribution<int> wt(1, 5);
+    int n_nets = 0;
+    while (n_nets < 8) {
+        int a = blk(rng), b = blk(rng);
+        if (a == b) continue;
+        d.connections.push_back({a, b, wt(rng)});
+        ++n_nets;
+    }
+    std::printf("  %d nets, %d blocks\n", n_nets, N);
+
+    mp::WAWirelength wa(d);
+
+    // Pin-position span (max - min over both axes), used to pick γ.
+    double span = 0.0;
+    for (int i = 0; i < N; ++i) {
+        for (int j = i + 1; j < N; ++j) {
+            span = std::max(span, std::abs(x[i] - x[j]));
+            span = std::max(span, std::abs(y[i] - y[j]));
+        }
+    }
+    if (span < 1.0) span = 1.0;
+
+    // Loose: large γ → smooth, well-resolved gradient.  Tight: small γ →
+    // approaches HPWL (mild numerical noise; still well within 1e-3 rel).
+    const double gammas[] = { 0.5 * span, 0.01 * span };
+    const double rel_tol = 1e-3;
+
+    for (double g : gammas) {
+        auto r0 = wa.compute(x, y, g);
+        std::printf("  γ=%g  cost=%.6g  |g|_∞ = ", g, r0.cost);
+        double gmax = 0.0;
+        for (int i = 0; i < N; ++i) {
+            gmax = std::max(gmax, std::abs(r0.grad_x[i]));
+            gmax = std::max(gmax, std::abs(r0.grad_y[i]));
+        }
+        std::printf("%.4e\n", gmax);
+
+        // Central-difference step: small relative to γ (so the smoothing
+        // doesn't dominate the derivative estimate).  Scale with span too.
+        const double eps = std::max(1e-5, std::min(g * 1e-4, span * 1e-6));
+
+        int worst_i = -1; char worst_axis = '?';
+        double worst_rel = 0.0, worst_ana = 0.0, worst_fd = 0.0;
+
+        for (int i = 0; i < N; ++i) {
+            auto xp = x; xp[i] += eps;
+            auto xm = x; xm[i] -= eps;
+            double cp = wa.compute(xp, y, g).cost;
+            double cm = wa.compute(xm, y, g).cost;
+            double dcdx = (cp - cm) / (2.0 * eps);
+            // descent: g = -∂cost/∂x  →  ∂cost/∂x = -g_descent
+            double ana_x = -r0.grad_x[i];
+            double err_x = rel_err(ana_x, dcdx);
+            if (err_x > worst_rel) {
+                worst_rel = err_x; worst_i = i; worst_axis = 'x';
+                worst_ana = ana_x; worst_fd = dcdx;
+            }
+
+            auto yp = y; yp[i] += eps;
+            auto ym = y; ym[i] -= eps;
+            cp = wa.compute(x, yp, g).cost;
+            cm = wa.compute(x, ym, g).cost;
+            double dcdy = (cp - cm) / (2.0 * eps);
+            double ana_y = -r0.grad_y[i];
+            double err_y = rel_err(ana_y, dcdy);
+            if (err_y > worst_rel) {
+                worst_rel = err_y; worst_i = i; worst_axis = 'y';
+                worst_ana = ana_y; worst_fd = dcdy;
+            }
+        }
+        std::printf("    worst rel_err = %.3e at block %d axis %c "
+                    "(ana=%+.4e fd=%+.4e)\n",
+                    worst_rel, worst_i, worst_axis, worst_ana, worst_fd);
+        assert(worst_rel < rel_tol);
+    }
+    std::printf("[test_fd_wa_gradient] PASS\n");
+}
+
+// 2-pin net at x = 0, 10 (weight 1): as γ → 0 (γ = 0.01·span), WA cost
+// must converge to exact HPWL within 1%.
+void test_wa_converges_to_hpwl() {
+    std::printf("[test_wa_converges_to_hpwl] start\n");
+
+    Design d;
+    d.outline.max_width  = 100.0;
+    d.outline.max_height = 100.0;
+    d.blocks.push_back(make_block("a", BlockType::SOFT, 0.0, 0.0));
+    d.blocks.push_back(make_block("b", BlockType::SOFT, 0.0, 0.0));
+    d.connections.push_back({0, 1, 1});
+
+    std::vector<double> x = {0.0, 10.0};
+    std::vector<double> y = {0.0, 0.0};
+    const double span = 10.0;
+    const double gamma_tight = 0.01 * span;
+
+    mp::WAWirelength wa(d);
+    auto r = wa.compute(x, y, gamma_tight);
+    double hpwl = wa.hpwl_exact(x, y);
+
+    double ratio = r.cost / hpwl;
+    std::printf("  γ=%g  WA=%.6f  HPWL=%.6f  ratio=%.6f\n",
+                gamma_tight, r.cost, hpwl, ratio);
+    assert(hpwl > 0.0);
+    assert(std::abs(ratio - 1.0) < 0.01);
+    std::printf("[test_wa_converges_to_hpwl] PASS\n");
+}
+
+// Doubling net weight must exactly double gradient magnitudes (within fp
+// epsilon).  Single 2-pin net.
+void test_weight_doubles_gradient() {
+    std::printf("[test_weight_doubles_gradient] start\n");
+
+    Design d1, d2;
+    d1.outline.max_width  = 100.0;
+    d1.outline.max_height = 100.0;
+    d2.outline = d1.outline;
+    d1.blocks.push_back(make_block("a", BlockType::SOFT, 0.0, 0.0));
+    d1.blocks.push_back(make_block("b", BlockType::SOFT, 0.0, 0.0));
+    d2.blocks = d1.blocks;
+
+    const int w = 3;
+    d1.connections.push_back({0, 1, w});
+    d2.connections.push_back({0, 1, 2 * w});
+
+    std::vector<double> x = {0.0, 10.0};
+    std::vector<double> y = {0.0, 0.0};
+    const double gamma = 0.5;
+
+    auto r1 = mp::WAWirelength(d1).compute(x, y, gamma);
+    auto r2 = mp::WAWirelength(d2).compute(x, y, gamma);
+
+    auto chk = [&](double g1, double g2, const char* label) {
+        if (std::abs(g1) < 1e-15 && std::abs(g2) < 1e-15) return;
+        double ratio = g2 / g1;
+        std::printf("  %s: g1=%+.6e g2=%+.6e ratio=%.9f\n",
+                    label, g1, g2, ratio);
+        assert(std::abs(ratio - 2.0) < 1e-9);
+    };
+    chk(r1.grad_x[0], r2.grad_x[0], "block0.gx");
+    chk(r1.grad_x[1], r2.grad_x[1], "block1.gx");
+    chk(r1.grad_y[0], r2.grad_y[0], "block0.gy");
+    chk(r1.grad_y[1], r2.grad_y[1], "block1.gy");
+
+    std::printf("[test_weight_doubles_gradient] PASS\n");
+}
+
 } // namespace
 
 int main() {
@@ -293,6 +466,9 @@ int main() {
     test_overlap_separating_forces();
     test_dc_zero();
     test_overflow_zero_at_uniform();
+    test_fd_wa_gradient();
+    test_wa_converges_to_hpwl();
+    test_weight_doubles_gradient();
     std::printf("\nALL TESTS PASSED\n");
     return 0;
 }
