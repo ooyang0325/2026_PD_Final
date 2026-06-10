@@ -28,7 +28,7 @@ inline double ANA_STEP           = 0.03; // per-iter step size (fraction of outl
 inline double ANA_REPEL          = 8.0;  // repulsion-vs-attraction weight
 
 // Mathematical-programming (analytical / ePlace-style) engine.
-inline std::string ENGINE        = "sa"; // "sa" | "mp"
+inline std::string ENGINE        = "mp"; // "sa" | "mp" (env: FP_ENGINE)
 inline int    MP_GRID            = 128;  // density-bin count per axis
 inline double MP_TARGET_OVF      = 0.08; // overflow target (Eq. 37) for termination
 inline int    MP_MAX_ITER        = 1500; // Nesterov iteration cap

@@ -240,11 +240,14 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
     bool have_best = false;
 
     if (use_mp) {
-        // MP path: skip tree-based finalize/legalize.  Just score the scatter.
-        if (is_valid()) {
-            best_score = route_and_score();
-            have_best  = is_valid();
-        }
+        // MP path: skip tree-based finalize/legalize.  Route unconditionally
+        // so d.paths is populated and the output .cfg always has a PATH
+        // section (user requirement: routing is mandatory even if the
+        // placement is invalid or the engine ran out of budget).  The
+        // resulting score still reflects overlap/FAIL state via the cost
+        // function below, so a valid layout from any other worker wins.
+        best_score = route_and_score();
+        have_best  = is_valid();
     } else if (cfg::LEG_ENABLE) {
         printf("[LegalizeLoop] Starting with score %.3f\n", route_and_score());
         finalize_output();
