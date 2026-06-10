@@ -11,7 +11,9 @@ HDRS = $(SRCDIR)/config.h $(SRCDIR)/types.h $(SRCDIR)/parser.h $(SRCDIR)/bstree.
        $(SRCDIR)/ft_estimator.h $(SRCDIR)/channel.h $(SRCDIR)/router.h \
        $(SRCDIR)/floorplan.h $(SRCDIR)/sa_optimizer.h $(SRCDIR)/legalize_loop.h \
        $(SRCDIR)/analytical_legalizer.h $(SRCDIR)/output.h \
-       $(SRCDIR)/mp_optimizer.h $(VENDDIR)/fft.h
+       $(SRCDIR)/mp_optimizer.h $(SRCDIR)/mp/density.h \
+       $(SRCDIR)/mp/wa_wirelength.h $(SRCDIR)/mp/nesterov.h \
+       $(VENDDIR)/fft.h
 
 OBJS = $(OBJDIR)/main.o \
        $(OBJDIR)/fft.o \
@@ -41,7 +43,8 @@ $(OBJDIR)/fftsg2d.o: $(VENDDIR)/fftsg2d.cpp $(VENDDIR)/fft.h
 TEST_BIN = bin/test_mp
 TEST_SRC = tests/test_mp.cpp
 TEST_HDRS = $(SRCDIR)/config.h $(SRCDIR)/types.h $(SRCDIR)/mp/density.h \
-            $(SRCDIR)/mp/wa_wirelength.h $(VENDDIR)/fft.h
+            $(SRCDIR)/mp/wa_wirelength.h $(SRCDIR)/mp/nesterov.h \
+            $(VENDDIR)/fft.h
 
 $(OBJDIR)/test_mp.o: $(TEST_SRC) $(TEST_HDRS)
 	@mkdir -p $(OBJDIR)

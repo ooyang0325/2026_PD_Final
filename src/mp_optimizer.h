@@ -1,13 +1,19 @@
 #pragma once
 #include "types.h"
+#include "config.h"
 #include "floorplan.h"
+#include "mp/density.h"
+#include "mp/wa_wirelength.h"
+#include "mp/nesterov.h"
 #include <random>
 #include <algorithm>
 #include <string>
+#include <vector>
 
-// Phase 1 stub for the mathematical-programming (ePlace-style) engine.
-// Just scatters blocks at seeded-random positions inside the max outline.
-// Subsequent phases will replace run() with WA + density + Nesterov.
+// Phase 4: replace the random-scatter stub with the ePlace-style Nesterov
+// solver.  Seeded random init still produces x0/y0; Nesterov::run then
+// descends to the configured overflow target.  CG-legalize / routability
+// loop arrive in Phases 5 and 6 (see docs/plans/2026-06-10-mp-floorplanner.md).
 class MPOptimizer {
 public:
     MPOptimizer(Floorplan& fp, Design& d, unsigned seed)
@@ -20,21 +26,17 @@ public:
         d_.outline.cur_height = H;
 
         std::uniform_real_distribution<double> u01(0.0, 1.0);
+        const int nb = static_cast<int>(d_.blocks.size());
 
-        int nb = (int)d_.blocks.size();
-        for (int i = 0; i < nb; i++) {
+        // ---- Seeded random scatter init (this becomes x0/y0) ----
+        std::vector<double> x0(nb), y0(nb);
+        for (int i = 0; i < nb; ++i) {
             auto& b = d_.blocks[i];
-
-            // Phase 1: leave width/height alone.  HARD already has fixed dims,
-            // SOFT keeps current dims (sized later by the routability loop),
-            // EDGE has been parsed with valid dims.
             double w = b.width, h = b.height;
-
             double maxx = std::max(0.0, W - w);
             double maxy = std::max(0.0, H - h);
 
             if (b.type == BlockType::EDGE && !b.locations.empty()) {
-                // Pick a random allowed location string (T/B/L/R combination).
                 std::uniform_int_distribution<int> pick(0, (int)b.locations.size() - 1);
                 int li = pick(rng_);
                 fp_.active_loc[i] = li;
@@ -46,17 +48,33 @@ public:
                 if (loc.find('R') != std::string::npos) x = maxx;
                 if (loc.find('B') != std::string::npos) y = 0.0;
                 if (loc.find('T') != std::string::npos) y = maxy;
-                b.lx = x;
-                b.ly = y;
+                x0[i] = x;
+                y0[i] = y;
             } else {
-                b.lx = u01(rng_) * maxx;
-                b.ly = u01(rng_) * maxy;
+                x0[i] = u01(rng_) * maxx;
+                y0[i] = u01(rng_) * maxy;
             }
-
-            // Keep Floorplan's parallel W/H arrays consistent so downstream
-            // helpers (channels, finalize) see matching dims.
             fp_.W[i] = w;
             fp_.H[i] = h;
+        }
+
+        // ---- Nesterov global place ----
+        mp::Density       dens(d_, cfg::MP_GRID);
+        mp::WAWirelength  wl(d_);
+        mp::NesterovParams params;
+        params.max_iter        = cfg::MP_MAX_ITER;
+        params.target_overflow = cfg::MP_TARGET_OVF;
+        params.init_lambda     = cfg::MP_INIT_LAMBDA;
+        params.phi_min         = cfg::MP_PHI_MIN;
+        params.phi_max         = cfg::MP_PHI_MAX;
+        mp::Nesterov nes(dens, wl, d_, params);
+        auto result = nes.run(x0, y0);
+
+        // Copy result back into the Design.  Even on divergence the returned
+        // snapshot is the best-tau point encountered (guard #7).
+        for (int i = 0; i < nb; ++i) {
+            d_.blocks[i].lx = result.x[i];
+            d_.blocks[i].ly = result.y[i];
         }
     }
 
