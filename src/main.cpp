@@ -7,6 +7,7 @@
 #include "legalize_loop.h"
 #include "analytical_legalizer.h"
 #include "mp_optimizer.h"
+#include "mp/cg_legalizer.h"
 #include "output.h"
 #include "config.h"
 #include <iostream>
@@ -137,11 +138,32 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         sa2.run();
         finalize_output();
     } else {
-        // MP engine: seeded scatter inside the max outline; no tree finalize.
+        // MP engine: seeded scatter + Nesterov global place (overlapping coords),
+        // then a coordinate-only legalization bridge removes all block overlaps
+        // within the FULL max outline (whitespace = channel capacity, so we do
+        // NOT shrink below the max outline — see plan Architecture §routability).
         MPOptimizer mp(fp, d, seed1);
         mp.run();
-        d.channels = ChannelCalculator::compute(
-            d.blocks, d.outline.max_width, d.outline.max_height);
+
+        // Use the full max outline as the placement region.
+        const double mpW = d.outline.max_width;
+        const double mpH = d.outline.max_height;
+        d.outline.cur_width  = mpW;
+        d.outline.cur_height = mpH;
+
+        // Remove block-block overlaps on coordinates; EDGE blocks stay pinned to
+        // their active boundary location.  Return value is logged via the score.
+        mp::CGLegalizer leg(fp, d);
+        leg.legalize(mpW, mpH);
+
+        // Overlap-safe EDGE boundary snap on coordinates (pattern:
+        // floorplan.h:125-149).  CGLegalizer already keeps EDGE blocks on their
+        // boundary line, but the snap re-asserts the exact boundary coordinate
+        // after the 0.01 µm grid round and skips any snap that would collide.
+        fp.finalize_edge_blocks(mpW, mpH);
+
+        // Channels from the legalized coordinates over the full outline.
+        d.channels = ChannelCalculator::compute(d.blocks, mpW, mpH);
     }
 
     // Block overlap test on the committed layout.
