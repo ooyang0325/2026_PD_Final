@@ -38,8 +38,24 @@ $(OBJDIR)/fftsg2d.o: $(VENDDIR)/fftsg2d.cpp $(VENDDIR)/fft.h
 	@mkdir -p $(OBJDIR)
 	$(CXX) $(CXXFLAGS) -c $(VENDDIR)/fftsg2d.cpp -o $@
 
+TEST_BIN = bin/test_mp
+TEST_SRC = tests/test_mp.cpp
+TEST_HDRS = $(SRCDIR)/config.h $(SRCDIR)/types.h $(SRCDIR)/mp/density.h \
+            $(VENDDIR)/fft.h
+
+$(OBJDIR)/test_mp.o: $(TEST_SRC) $(TEST_HDRS)
+	@mkdir -p $(OBJDIR)
+	$(CXX) $(CXXFLAGS) -c $(TEST_SRC) -o $@
+
+$(TEST_BIN): $(OBJDIR)/test_mp.o $(OBJDIR)/fft.o $(OBJDIR)/fftsg.o $(OBJDIR)/fftsg2d.o
+	@mkdir -p $(TARGER_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
+test: $(TEST_BIN)
+	./$(TEST_BIN)
+
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(TEST_BIN)
 	rm -rf $(OBJDIR)
 
-.PHONY: clean
+.PHONY: clean test
