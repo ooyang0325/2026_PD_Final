@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdlib>
+#include <string>
 
 // Global tunable parameters.  Defaults are the production values; each can be
 // overridden via an environment variable for offline parameter sweeps.  Values
@@ -26,6 +27,18 @@ inline int    ANA_ITERS          = 128;   // force-directed iterations
 inline double ANA_STEP           = 0.03; // per-iter step size (fraction of outline dim)
 inline double ANA_REPEL          = 8.0;  // repulsion-vs-attraction weight
 
+// Mathematical-programming (analytical / ePlace-style) engine.
+inline std::string ENGINE        = "sa"; // "sa" | "mp"
+inline int    MP_GRID            = 128;  // density-bin count per axis
+inline double MP_TARGET_OVF      = 0.08; // overflow target (Eq. 37) for termination
+inline int    MP_MAX_ITER        = 1500; // Nesterov iteration cap
+inline double MP_INIT_LAMBDA     = 8e-5; // λ0 scale (ePlace Eq. 35)
+inline double MP_PHI_MIN         = 0.95; // phiCoef clamp lower
+inline double MP_PHI_MAX         = 1.05; // phiCoef clamp upper
+inline double MP_HALO_SCALE      = 1.0;  // demand-driven halo multiplier
+inline int    MP_RB_ITERS        = 4;    // routability outer-loop iterations
+inline double MP_TDENSITY        = 0.0;  // ρt target (0 = auto from utilization)
+
 inline void load_from_env() {
     if (const char* e = std::getenv("FP_HALO"))    HALO = std::atof(e);
     if (const char* e = std::getenv("FP_FTP"))     FT_TRAVERSE_PENALTY = std::atof(e);
@@ -36,6 +49,16 @@ inline void load_from_env() {
     if (const char* e = std::getenv("FP_LEG_TIME"))  LEG_TIME   = std::atof(e);
     if (const char* e = std::getenv("FP_LEG_TRIES")) LEG_TRIES  = std::atoi(e);
     if (const char* e = std::getenv("FP_LEG_ENABLE")) LEG_ENABLE = std::atoi(e);
+    if (const char* e = std::getenv("FP_ENGINE"))      ENGINE = e;
+    if (const char* e = std::getenv("MP_GRID"))        MP_GRID = std::atoi(e);
+    if (const char* e = std::getenv("MP_TARGET_OVF"))  MP_TARGET_OVF = std::atof(e);
+    if (const char* e = std::getenv("MP_MAX_ITER"))    MP_MAX_ITER = std::atoi(e);
+    if (const char* e = std::getenv("MP_INIT_LAMBDA")) MP_INIT_LAMBDA = std::atof(e);
+    if (const char* e = std::getenv("MP_PHI_MIN"))     MP_PHI_MIN = std::atof(e);
+    if (const char* e = std::getenv("MP_PHI_MAX"))     MP_PHI_MAX = std::atof(e);
+    if (const char* e = std::getenv("MP_HALO_SCALE"))  MP_HALO_SCALE = std::atof(e);
+    if (const char* e = std::getenv("MP_RB_ITERS"))    MP_RB_ITERS = std::atoi(e);
+    if (const char* e = std::getenv("MP_TDENSITY"))    MP_TDENSITY = std::atof(e);
 }
 
 } // namespace cfg

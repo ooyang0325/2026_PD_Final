@@ -6,6 +6,7 @@
 #include "sa_optimizer.h"
 #include "legalize_loop.h"
 #include "analytical_legalizer.h"
+#include "mp_optimizer.h"
 #include "output.h"
 #include "config.h"
 #include <iostream>
@@ -119,19 +120,29 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         gr.route_all(d, 20);
     };
 
-    // ── SA phase 1 ──────────────────────────────────────────────────────────
-    SAOptimizer sa(fp, seed1);
-    sa.time_limit_sec = sa1_time;
-    sa.run();
-    finalize_output();
+    const bool use_mp = (cfg::ENGINE == "mp");
 
-    // ── SA phase 2 (fine) ───────────────────────────────────────────────────
-    // Pack at base area to satisfy the fixed outline; the convergence loop below
-    // sizes soft blocks to the real feedthrough.
-    SAOptimizer sa2(fp, seed2);
-    sa2.time_limit_sec = sa2_time;
-    sa2.run();
-    finalize_output();
+    if (!use_mp) {
+        // ── SA phase 1 ──────────────────────────────────────────────────────
+        SAOptimizer sa(fp, seed1);
+        sa.time_limit_sec = sa1_time;
+        sa.run();
+        finalize_output();
+
+        // ── SA phase 2 (fine) ───────────────────────────────────────────────
+        // Pack at base area to satisfy the fixed outline; the convergence loop
+        // below sizes soft blocks to the real feedthrough.
+        SAOptimizer sa2(fp, seed2);
+        sa2.time_limit_sec = sa2_time;
+        sa2.run();
+        finalize_output();
+    } else {
+        // MP engine: seeded scatter inside the max outline; no tree finalize.
+        MPOptimizer mp(fp, d, seed1);
+        mp.run();
+        d.channels = ChannelCalculator::compute(
+            d.blocks, d.outline.max_width, d.outline.max_height);
+    }
 
     // Block overlap test on the committed layout.
     auto has_overlap = [&]() {
@@ -228,7 +239,13 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
     double best_score = 1e18;
     bool have_best = false;
 
-    if (cfg::LEG_ENABLE) {
+    if (use_mp) {
+        // MP path: skip tree-based finalize/legalize.  Just score the scatter.
+        if (is_valid()) {
+            best_score = route_and_score();
+            have_best  = is_valid();
+        }
+    } else if (cfg::LEG_ENABLE) {
         printf("[LegalizeLoop] Starting with score %.3f\n", route_and_score());
         finalize_output();
         if (is_valid()) {
@@ -333,7 +350,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         if (have_best) { d = best_d; fp.W = best_W; fp.H = best_H; }
     }
 
-    if (!have_best) {
+    if (!have_best && !use_mp) {
         // Emergency fallback: nothing valid — base area, clean snapped + routed.
         std::fill(fp.ft_nets.begin(), fp.ft_nets.end(), 0);
         fp.apply_ft_areas(true);
