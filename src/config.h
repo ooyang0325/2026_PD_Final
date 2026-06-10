@@ -38,6 +38,7 @@ inline double MP_PHI_MAX         = 1.05; // phiCoef clamp upper
 inline double MP_HALO_SCALE      = 1.0;  // demand-driven halo multiplier
 inline int    MP_RB_ITERS        = 4;    // routability outer-loop iterations
 inline double MP_TDENSITY        = 0.0;  // ρt target (0 = auto from utilization)
+inline int    MP_RB_DEBUG        = 0;    // 1 = trace routability outer loop to stderr
 
 inline void load_from_env() {
     if (const char* e = std::getenv("FP_HALO"))    HALO = std::atof(e);
@@ -59,6 +60,7 @@ inline void load_from_env() {
     if (const char* e = std::getenv("MP_HALO_SCALE"))  MP_HALO_SCALE = std::atof(e);
     if (const char* e = std::getenv("MP_RB_ITERS"))    MP_RB_ITERS = std::atoi(e);
     if (const char* e = std::getenv("MP_TDENSITY"))    MP_TDENSITY = std::atof(e);
+    if (const char* e = std::getenv("MP_RB_DEBUG"))    MP_RB_DEBUG = std::atoi(e);
 }
 
 } // namespace cfg

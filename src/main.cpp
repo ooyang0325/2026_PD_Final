@@ -248,7 +248,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
             if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
             double required = d.blocks[i].get_target_area(fp.ft_nets[i]);
             double actual   = fp.W[i] * fp.H[i];
-            if (actual < required - 1.0) { pen++; mag += (required - actual); }
+            if (actual < required - 1e-9) { pen++; mag += (required - actual); }
         }
         return compute_final_cost(d) + FAILW * count_edge_fails() + PEN * pen + mag;
     };
@@ -268,8 +268,229 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         // placement is invalid or the engine ran out of budget).  The
         // resulting score still reflects overlap/FAIL state via the cost
         // function below, so a valid layout from any other worker wins.
+        // This single route also populates fp.ft_nets (via collect_ft inside
+        // route_and_score), which the routability loop below needs.
         best_score = route_and_score();
         have_best  = is_valid();
+
+        // ── Phase 5: routability outer loop (greedy FT-aware soft sizing) ────
+        // Engaged ONLY when this seed yielded a valid, penalised layout.  For an
+        // invalid seed (e.g. a tight 80%-util placement the legalizer couldn't
+        // untangle) we do NOTHING extra here — the code path above is identical
+        // to the pre-Phase-5 single-route behavior, so multi-start restart
+        // throughput is preserved and a later worker/restart still finds a valid
+        // layout (guard #7: never regress fails by stealing restart budget).
+        //
+        // Routing reveals per-soft-block feedthrough load (ft_nets) and channel
+        // flow.  Soft-undersize penalties fire when a soft block's area is below
+        // its FT target (types.h get_target_area == evaluator.py:258-266).  At
+        // high utilization the sum of FT-target deficits can exceed the free
+        // whitespace (b50u60 needs ~21M extra into ~18M free), so an all-at-once
+        // resize blows the outline → fails.  We therefore grow soft blocks ONE AT
+        // A TIME, largest-deficit first, gated by a CHEAP route-free legalization
+        // feasibility check; each growth that stays valid removes exactly one
+        // undersize penalty by construction.  After each batch of growths we
+        // re-route ONCE and commit the pass only on a strict lexicographic
+        // improvement (fails, then penalties, then cost) — never trading a
+        // penalty for cost, never accepting a fails regression.
+        // source: plan Phase 5 (greedy knapsack of FT targets under the
+        // fixed-outline whitespace budget).
+        if (have_best && best_score < FAILW && cfg::MP_RB_ITERS > 1) {
+            const double mpW = d.outline.max_width;
+            const double mpH = d.outline.max_height;
+
+            // Lexicographic measure: (fails, penalties, cost).  Routes once.
+            auto measure_state = [&](int& fails, int& penalties, double& cost) {
+                GlobalRouter gr;
+                gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
+                gr.route_all(d, 20);
+                collect_ft();
+                int pen = 0;
+                for (auto& ch : d.channels) {
+                    if (ch.nets_x > ch.cap_x() + 1e-3) pen++;
+                    if (ch.nets_y > ch.cap_y() + 1e-3) pen++;
+                }
+                for (int i = 0; i < (int)d.blocks.size(); i++) {
+                    if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
+                    // Match the evaluator's 1e-3 tolerance (evaluator.py:269).
+                    if (fp.W[i] * fp.H[i] <
+                        d.blocks[i].get_target_area(fp.ft_nets[i]) - 1e-3) pen++;
+                }
+                penalties = pen;
+                fails = count_edge_fails() + (is_valid() ? 0 : 1);
+                cost  = compute_final_cost(d);
+            };
+
+            // Resize ONE soft block to its measured FT target, preserving the
+            // current AR clamped to [min_ar,max_ar].  Updates fp.W/H AND d.blocks
+            // dims (the evaluator reads d.blocks).  False if already big enough.
+            // source: types.h get_target_area; AR clamp mirrors apply_ft_areas.
+            auto resize_one_to_ft = [&](int i) -> bool {
+                if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0)
+                    return false;
+                const double required = d.blocks[i].get_target_area(fp.ft_nets[i]);
+                if (required <= fp.W[i] * fp.H[i] + 1e-3) return false;
+                double ar = (fp.H[i] > 0) ? fp.W[i] / fp.H[i] : 1.0;
+                double mn = d.blocks[i].min_ar, mx = d.blocks[i].max_ar;
+                if (mx >= mn && mx > 0.0) ar = std::max(mn, std::min(mx, ar));
+                // 1e-4 overshoot ensures the sqrt→ceil chain almost always lands
+                // above 'required' in one shot; the while loop is the backstop for
+                // the rare case where ceil-rounding still undershoots (e.g. BLK02
+                // deficit = 0.91 µm² with 1e-6 overshoot).
+                double target = required * (1.0 + 1e-4);
+                double raw_w = std::sqrt(target * ar);
+                fp.W[i] = std::ceil(raw_w * 100.0) / 100.0;
+                fp.H[i] = std::ceil((target / fp.W[i]) * 100.0) / 100.0;
+                while (fp.W[i] * fp.H[i] < required) fp.H[i] += 0.01;
+                d.blocks[i].width  = fp.W[i];
+                d.blocks[i].height = fp.H[i];
+                return true;
+            };
+
+            // Cheap route-free feasibility: legalize current dims, snap edges,
+            // report fail count.  Gates each single-block growth in µs.
+            auto legalize_and_fails = [&]() -> int {
+                mp::CGLegalizer lg(fp, d);
+                lg.legalize(mpW, mpH);
+                fp.finalize_edge_blocks(mpW, mpH);
+                d.channels = ChannelCalculator::compute(d.blocks, mpW, mpH);
+                return count_edge_fails() + (is_valid() ? 0 : 1);
+            };
+
+            // Full mutable snapshot for lexicographic rollback.
+            struct Snap {
+                std::vector<Block> blocks; std::vector<Channel> channels;
+                std::vector<RoutePath> paths; Outline outline;
+                std::vector<double> W, H; std::vector<int> ft_nets, active_loc;
+            };
+            auto take_snap = [&]() {
+                Snap s; s.blocks = d.blocks; s.channels = d.channels;
+                s.paths = d.paths; s.outline = d.outline; s.W = fp.W; s.H = fp.H;
+                s.ft_nets = fp.ft_nets; s.active_loc = fp.active_loc; return s;
+            };
+            auto restore_snap = [&](const Snap& s) {
+                d.blocks = s.blocks; d.channels = s.channels; d.paths = s.paths;
+                d.outline = s.outline; fp.W = s.W; fp.H = s.H;
+                fp.ft_nets = s.ft_nets; fp.active_loc = s.active_loc;
+            };
+
+            // Baseline = the already-routed valid iter0.
+            int best_fails = 0, best_pen = 0;
+            double best_cost = 0.0;
+            measure_state(best_fails, best_pen, best_cost);
+            Snap best_snap = take_snap();
+            if (cfg::MP_RB_DEBUG)
+                fprintf(stderr, "[RB iter0] fails=%d pen=%d cost=%.3e\n",
+                        best_fails, best_pen, best_cost);
+
+            const int RB_ITERS = std::max(1, cfg::MP_RB_ITERS);
+            for (int pass = 1; pass < RB_ITERS; pass++) {
+                if (best_fails == 0 && best_pen == 0) break;  // already clean
+                restore_snap(best_snap);                      // work from best
+
+                // Candidate undersized soft blocks, largest area-deficit first.
+                std::vector<std::pair<double,int>> cands;
+                for (int i = 0; i < (int)d.blocks.size(); i++) {
+                    if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
+                    double req = d.blocks[i].get_target_area(fp.ft_nets[i]);
+                    double act = fp.W[i] * fp.H[i];
+                    if (act < req - 1e-3) cands.push_back({req - act, i});
+                }
+                std::sort(cands.begin(), cands.end(),
+                          [](const auto& a, const auto& b){ return a.first > b.first; });
+
+                int grown = 0;
+                for (auto& [deficit, i] : cands) {
+                    (void)deficit;
+                    double sW = fp.W[i], sH = fp.H[i];
+                    double sbw = d.blocks[i].width, sbh = d.blocks[i].height;
+                    std::vector<double> cx, cy;
+                    cx.reserve(d.blocks.size()); cy.reserve(d.blocks.size());
+                    for (auto& b : d.blocks) { cx.push_back(b.lx); cy.push_back(b.ly); }
+
+                    if (!resize_one_to_ft(i)) continue;
+                    if (legalize_and_fails() <= best_fails) {
+                        grown++;
+                    } else {
+                        // Revert this block's growth and the legalized coords.
+                        fp.W[i] = sW; fp.H[i] = sH;
+                        d.blocks[i].width = sbw; d.blocks[i].height = sbh;
+                        for (int k = 0; k < (int)d.blocks.size(); k++) {
+                            d.blocks[k].lx = cx[k]; d.blocks[k].ly = cy[k];
+                        }
+                        d.channels = ChannelCalculator::compute(d.blocks, mpW, mpH);
+                    }
+                }
+
+                // Re-route ONCE and re-measure the true penalty count.
+                int it_fails = 0, it_pen = 0; double it_cost = 0.0;
+                measure_state(it_fails, it_pen, it_cost);
+                bool better =
+                    (it_fails <  best_fails) ||
+                    (it_fails == best_fails && it_pen <  best_pen) ||
+                    (it_fails == best_fails && it_pen == best_pen &&
+                     it_cost < best_cost - 1.0);
+                if (better) {
+                    best_fails = it_fails; best_pen = it_pen; best_cost = it_cost;
+                    best_snap = take_snap();
+                } else {
+                    restore_snap(best_snap);             // discard this pass
+                }
+                if (cfg::MP_RB_DEBUG)
+                    fprintf(stderr, "[RB pass%d] grown=%d -> f=%d p=%d c=%.3e "
+                            "(best f=%d p=%d)\n", pass, grown, it_fails, it_pen,
+                            it_cost, best_fails, best_pen);
+                if (grown == 0) break;                   // fixpoint
+            }
+
+            // Commit the best snapshot and re-route it so d.paths/d.channels
+            // match the returned layout exactly (output .cfg consistency).
+            restore_snap(best_snap);
+            best_score = route_and_score();
+            have_best  = is_valid();
+
+            // ── Final FT-clearing safety pass ───────────────────────────────
+            // The committed re-route above may assign feedthrough to a soft block
+            // that the in-loop routing did not (routing is order-dependent), so a
+            // block can end up fractionally undersized for the FINAL paths even
+            // though the loop saw it satisfied (e.g. case00 BLK02 misses its
+            // target by 0.91 µm²).  Make one more route-free growth pass against
+            // the just-committed ft_nets, accepting each growth only if it keeps
+            // the layout valid; then re-route once more.  Pure safety net — it can
+            // only remove undersize penalties, never add fails (guard #7).
+            if (have_best && best_score < FAILW) {
+                bool any = false;
+                for (int i = 0; i < (int)d.blocks.size(); i++) {
+                    if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
+                    if (fp.W[i] * fp.H[i] >=
+                        d.blocks[i].get_target_area(fp.ft_nets[i]) - 1e-3) continue;
+                    double sW = fp.W[i], sH = fp.H[i];
+                    double sbw = d.blocks[i].width, sbh = d.blocks[i].height;
+                    std::vector<double> cx, cy;
+                    for (auto& b : d.blocks) { cx.push_back(b.lx); cy.push_back(b.ly); }
+                    if (!resize_one_to_ft(i)) continue;
+                    if (legalize_and_fails() <= 0) {
+                        any = true;
+                    } else {
+                        fp.W[i] = sW; fp.H[i] = sH;
+                        d.blocks[i].width = sbw; d.blocks[i].height = sbh;
+                        for (int k = 0; k < (int)d.blocks.size(); k++) {
+                            d.blocks[k].lx = cx[k]; d.blocks[k].ly = cy[k];
+                        }
+                        d.channels = ChannelCalculator::compute(d.blocks, mpW, mpH);
+                    }
+                }
+                if (any) {
+                    double s2 = route_and_score();
+                    if (is_valid() && s2 < best_score - 1.0) {
+                        best_score = s2; have_best = true;
+                    }
+                    // If it didn't help by our score, the re-route already left
+                    // d in a valid state (legalize_and_fails gated each growth);
+                    // keep it — area only grew, which cannot add fails.
+                }
+            }
+        }
     } else if (cfg::LEG_ENABLE) {
         printf("[LegalizeLoop] Starting with score %.3f\n", route_and_score());
         finalize_output();
@@ -382,6 +603,25 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         finalize_output();
         route_now();
         best_score = route_and_score();
+    }
+
+    // Guarantee every soft-block's OUTPUT dimensions (written at 2dp by the
+    // output writer) give W_2dp * H_2dp >= base area from the CSV.
+    // sqrt(area) at 2dp loses up to ~1 µm² (e.g. sqrt(409985)=640.30→409984.09)
+    // which the evaluator counts as a penalty (tolerance = 1e-3).
+    // This only fires for ft_nets=0 blocks whose dims were never grown by the FT
+    // loop; for those blocks fp.W*fp.H==area in float64 but the 2dp write loses it.
+    for (int i = 0; i < (int)d.blocks.size(); i++) {
+        if (d.blocks[i].type != BlockType::SOFT) continue;
+        // Simulate what the output writer will produce (std::fixed setprecision(2)).
+        double w_out = std::round(fp.W[i] * 100.0) / 100.0;
+        double h_out = std::round(fp.H[i] * 100.0) / 100.0;
+        if (w_out * h_out >= d.blocks[i].area - 1e-9) continue;
+        // Ceil H at 2dp so that w_out * H_2dp >= area.
+        fp.H[i] = std::ceil((d.blocks[i].area / w_out) * 100.0) / 100.0;
+        while (w_out * fp.H[i] < d.blocks[i].area) fp.H[i] += 0.01;
+        d.blocks[i].width  = fp.W[i];
+        d.blocks[i].height = fp.H[i];
     }
 
     d_in = d;
