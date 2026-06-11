@@ -44,6 +44,12 @@ inline double ANA_REPEL          = 8.0;  // repulsion-vs-attraction weight
 inline int    EXP_ENABLE         = 1;    // 0 = skip the in-place expansion pass
 inline int    EXP_ITERS          = 8;    // max grow→reroute rounds
 
+// Restarts per worker.  The legacy schedule (sa1 = 0.75 x remaining) gives one
+// restart regardless of budget; equal slices give every worker independent
+// draws — run-to-run penalty variance (7 vs 18 on b50u60) dwarfs the per-draw
+// quality loss from a shorter anneal.
+inline int    RESTARTS           = 2;
+
 // Router: per-soft-block feedthrough load cap.  Loads at or below this stay in
 // the cheapest FT-rate tier; the router charges escalating cost above it.
 inline double FT_SOFT_CAP        = 3000.0;
@@ -63,6 +69,7 @@ inline void load_from_env() {
     if (const char* e = std::getenv("FP_LEG_ENABLE")) LEG_ENABLE = std::atoi(e);
     if (const char* e = std::getenv("FP_EXP_ENABLE")) EXP_ENABLE = std::atoi(e);
     if (const char* e = std::getenv("FP_EXP_ITERS"))  EXP_ITERS  = std::atoi(e);
+    if (const char* e = std::getenv("FP_RESTARTS"))   RESTARTS   = std::atoi(e);
     if (const char* e = std::getenv("FP_FT_CAP"))     FT_SOFT_CAP = std::atof(e);
 }
 

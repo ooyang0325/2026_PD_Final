@@ -241,7 +241,9 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                               /*is_valid=*/ is_valid,
                               seed1 ^ 0xACE5EEDu);
             loop.max_iters      = cfg::LEG_ITERS;
-            loop.max_seconds    = cfg::LEG_TIME;
+            // Scale with the restart slice so multi-restart schedules don't
+            // multiply the (unbudgeted) legalize wall time.
+            loop.max_seconds    = std::min(cfg::LEG_TIME, sa1_time + sa2_time);
             loop.displace_tries = cfg::LEG_TRIES;
             best_score = loop.run();
             have_best  = is_valid();
@@ -434,6 +436,16 @@ static std::pair<double, Design> run_search(const Design& d,
     double total_budget = time_limit * 0.95;
     const double min_restart = 10.0;
 
+    // Equal slices: every restart is an independent draw of the same size.
+    // The legacy 0.75-x-remaining schedule spent 95% of any budget on one
+    // draw.  Extra draws only pay off when each slice still anneals properly:
+    // halving a 40s budget measurably regressed (32 vs 7-18 penalties), so
+    // never slice below 60s — small budgets keep one full-strength draw.
+    const double min_slice = 60.0;
+    int affordable = std::max(1, (int)(total_budget / min_slice));
+    int target_restarts = std::max(1, std::min(cfg::RESTARTS, affordable));
+    double slice = std::max(min_restart, total_budget / target_restarts);
+
     Design best_d = d;
     double best_cost = 1e18;
     int restart = 0;
@@ -442,8 +454,9 @@ static std::pair<double, Design> run_search(const Design& d,
         double remaining = total_budget - elapsed();
         if (remaining < min_restart) break;
 
-        double sa1_t = remaining * 0.75;
-        double sa2_t = remaining * 0.20;
+        double t = std::min(slice, remaining);
+        double sa1_t = t * 0.75;
+        double sa2_t = t * 0.20;
 
         unsigned seed1 = mix_seed(seed_base, (unsigned)(restart * 2));
         unsigned seed2 = mix_seed(seed_base, (unsigned)(restart * 2 + 1));
