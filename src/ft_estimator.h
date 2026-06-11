@@ -96,6 +96,44 @@ inline double cost(const std::vector<Block>& blocks,
     return total;
 }
 
+// Like cost(), but also accumulates per-block loads and returns the load mass
+// above `cap` ("concentration excess") in the same pass.  Minimizing the
+// excess spreads the through-traffic away from artery blocks: the routed FT
+// piles onto blocks the demand lines cross, and a load above the cheapest
+// conversion-rate tier grows quadratically in required area — quickly past
+// what the surrounding whitespace can absorb.
+struct CostConc { double total = 0, excess = 0; };
+
+inline CostConc cost_conc(const std::vector<Block>& blocks,
+                          const std::vector<Connection>& conns,
+                          const std::vector<double>& x, const std::vector<double>& y,
+                          const std::vector<double>& W, const std::vector<double>& H,
+                          double cap, std::vector<double>& load) {
+    int n = (int)blocks.size();
+    const double GAP = 3.0;
+    load.assign(n, 0.0);
+    CostConc r;
+    for (const auto& c : conns) {
+        int A = c.from, B = c.to;
+        if (adjacent(x[A], y[A], W[A], H[A], x[B], y[B], W[B], H[B], GAP)) continue;
+        double cax = x[A] + W[A] * 0.5, cay = y[A] + H[A] * 0.5;
+        double cbx = x[B] + W[B] * 0.5, cby = y[B] + H[B] * 0.5;
+        int crossed = 0;
+        for (int i = 0; i < n; i++) {
+            if (i == A || i == B) continue;
+            if (blocks[i].type != BlockType::SOFT) continue;
+            if (seg_rect(cax, cay, cbx, cby, x[i], y[i], W[i], H[i])) {
+                crossed++;
+                load[i] += c.nets;
+            }
+        }
+        if (crossed > 0) r.total += (double)c.nets * crossed;
+    }
+    for (int i = 0; i < n; i++)
+        if (load[i] > cap) r.excess += load[i] - cap;
+    return r;
+}
+
 // Estimate per-block feedthrough net loads.  Writes ft_nets[i] for SOFT blocks.
 inline void estimate(const std::vector<Block>& blocks,
                      const std::vector<Connection>& conns,

@@ -38,8 +38,22 @@ public:
     double gamma = 100.0; // outline-violation weight (PA2 uses 100)
     double ftw   = 0.0;   // feedthrough penalty weight (0 until SA enables it)
 
+    // Shape-term weights, per-instance so the worker portfolio can run half
+    // the searches with them and half without: they trade base packing
+    // quality for artery/moat structure, which wins only on cases where that
+    // structure is the binding constraint (e.g. b50u65), and the penalty-aware
+    // final score picks the better strategy per case.
+    double ftcw  = cfg::FTCW;
+    double moatw = cfg::MOATW;
+
     // padded scratch for HALO evaluation (reused, no per-eval alloc)
     std::vector<double> pad_W, pad_H;
+
+    // scratch for the FT-concentration and cut-overflow cost terms (reused;
+    // mutable because compute_cost is const)
+    mutable std::vector<double> ft_load_scratch;
+    struct CutEv { double pos; double dcap; double ddem; };
+    mutable std::vector<CutEv> cut_evs;
 
     Floorplan(Design& d_) : d(d_), bst((int)d_.blocks.size()),
         W(d_.blocks.size()), H(d_.blocks.size()),
@@ -191,16 +205,74 @@ public:
         double penalty = gamma * (wv + hv);
 
         if (ftw > 0.0) {
-            double ft = ftest::cost(d.blocks, d.connections, bst.x, bst.y, W, H);
-            penalty += ftw * (ft / Fnorm);
+            auto fc = ftest::cost_conc(d.blocks, d.connections, bst.x, bst.y, W, H,
+                                       cfg::FT_EST_CAP, ft_load_scratch);
+            penalty += ftw * (fc.total / Fnorm);
+            // Concentration: total FT being low is not enough — the same mass
+            // piled onto one artery block is a guaranteed unfixable penalty,
+            // spread across many blocks it is absorbed by in-place expansion.
+            if (ftcw > 0.0)
+                penalty += ftcw * (fc.excess / Fnorm);
         }
 
         // Routing-aware: keep high-demand pairs close (wide connecting channel).
         if (cfg::PCONGW > 0.0)
             penalty += cfg::PCONGW * (compute_congestion() / Wnorm);
 
+        // Cut overflow: demand straddling a vertical/horizontal cut beyond the
+        // cut's carrying capacity cannot be routed by ANY router — the blocks
+        // must move to the same side.  Normalized per direction by the
+        // full-die cut capacity so the term is O(1).
+        if (moatw > 0.0) {
+            double ox = cut_overflow_axis(true,  chip_w, chip_h);
+            double oy = cut_overflow_axis(false, chip_w, chip_h);
+            penalty += moatw * (ox / (25.0 * chip_h) + oy / (25.0 * chip_w));
+        }
+
         penalty += edge_block_penalty(max_w, max_h);
         return base + penalty;
+    }
+
+    // Worst-cut overflow along one axis (vertical=true sweeps x-cuts that
+    // left-right demand must cross).  Sweep events: a block crossing the cut
+    // removes 25*span of channel capacity and (if SOFT) credits FT_EST_CAP of
+    // absorbable feedthrough; a connection adds its nets between its two
+    // block centers.  Returns max over cuts of (demand - capacity), >= 0.
+    double cut_overflow_axis(bool vertical, double chip_w, double chip_h) const {
+        int n = (int)d.blocks.size();
+        double span_total = vertical ? chip_h : chip_w;
+        cut_evs.clear();
+        for (int i = 0; i < n; i++) {
+            double lo   = vertical ? bst.x[i] : bst.y[i];
+            double len  = vertical ? W[i] : H[i];
+            double hgt  = vertical ? H[i] : W[i];
+            double ftc  = (d.blocks[i].type == BlockType::SOFT) ? cfg::FT_EST_CAP : 0.0;
+            double dcap = -25.0 * hgt + ftc; // crossing block: less channel, some FT
+            cut_evs.push_back({lo,        dcap, 0.0});
+            cut_evs.push_back({lo + len, -dcap, 0.0});
+        }
+        for (auto& c : d.connections) {
+            int a = c.from, b = c.to;
+            double ca = vertical ? bst.x[a] + W[a] * 0.5 : bst.y[a] + H[a] * 0.5;
+            double cb = vertical ? bst.x[b] + W[b] * 0.5 : bst.y[b] + H[b] * 0.5;
+            if (ca > cb) std::swap(ca, cb);
+            cut_evs.push_back({ca,  0.0,  (double)c.nets});
+            cut_evs.push_back({cb,  0.0, -(double)c.nets});
+        }
+        std::sort(cut_evs.begin(), cut_evs.end(),
+                  [](const CutEv& a, const CutEv& b){ return a.pos < b.pos; });
+
+        double cap_delta = 0, dem = 0, worst = 0;
+        for (size_t k = 0; k < cut_evs.size(); k++) {
+            cap_delta += cut_evs[k].dcap;
+            dem       += cut_evs[k].ddem;
+            // measure on the open segment after this event group
+            if (k + 1 < cut_evs.size() && cut_evs[k+1].pos - cut_evs[k].pos < 1e-9)
+                continue;
+            double cap = 25.0 * span_total + cap_delta;
+            worst = std::max(worst, dem - cap);
+        }
+        return worst;
     }
 
     // Penalise edge blocks for not being at the chip boundary, plus a collision

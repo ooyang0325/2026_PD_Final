@@ -1,6 +1,7 @@
 #pragma once
 #include "types.h"
 #include "channel.h"
+#include "config.h"
 #include <vector>
 #include <queue>
 #include <map>
@@ -44,17 +45,19 @@ class GlobalRouter {
 public:
     std::vector<RectInfo> rects;
     std::vector<double> ch_penalty;
+    // Max FT nets each SOFT block can absorb by in-place growth into its
+    // surrounding whitespace (optimistic, used only by the relief pass to
+    // flag truly hopeless overloads).
+    std::vector<double> ft_cap;
+    // Blocks whose interior is priced out during the relief re-route.
+    std::set<int> ft_relief;
     int n_blocks = 0;
-
-    // Cost multiplier for routing through a SOFT block (feedthrough).  > 1 so the
-    // router prefers channels; feedthrough is used only when unavoidable.
-    static constexpr double FT_TRAVERSE_PENALTY = 3.0;
 
     std::unordered_map<std::string, int> name_to_idx;
 
     void init(const std::vector<Block>& blocks,
               const std::vector<Channel>& channels,
-              double /*ow*/, double /*oh*/) {
+              double ow, double oh) {
         rects.clear();
         name_to_idx.clear();
         n_blocks = (int)blocks.size();
@@ -78,6 +81,47 @@ public:
             rects.push_back(r);
         }
         ch_penalty.assign(channels.size(), 1.0);
+        compute_ft_caps(blocks, ow, oh);
+    }
+
+    // Per-block absorbable FT load: how far can the block grow in place
+    // (bounded by neighbors and the outline) and how many nets does that area
+    // buy under the tiered conversion rates?  f(n) = (n/25)*rate(n)/2 is the
+    // side extension a load of n demands; invert per tier, keep the largest
+    // feasible candidate.
+    void compute_ft_caps(const std::vector<Block>& blocks, double ow, double oh) {
+        ft_cap.assign(blocks.size(), 0.0);
+        for (int i = 0; i < (int)blocks.size(); i++) {
+            const Block& b = blocks[i];
+            if (b.type != BlockType::SOFT) continue;
+            double L = b.lx, R = ow - (b.lx + b.width);
+            double D = b.ly, U = oh - (b.ly + b.height);
+            for (int j = 0; j < (int)blocks.size(); j++) {
+                if (j == i) continue;
+                const Block& o = blocks[j];
+                bool yo = o.ly < b.ly + b.height - 1e-9 && o.ly + o.height > b.ly + 1e-9;
+                bool xo = o.lx < b.lx + b.width  - 1e-9 && o.lx + o.width  > b.lx + 1e-9;
+                if (yo) {
+                    if (o.lx + o.width <= b.lx + 1e-9)      L = std::min(L, b.lx - (o.lx + o.width));
+                    else if (o.lx >= b.lx + b.width - 1e-9) R = std::min(R, o.lx - (b.lx + b.width));
+                }
+                if (xo) {
+                    if (o.ly + o.height <= b.ly + 1e-9)      D = std::min(D, b.ly - (o.ly + o.height));
+                    else if (o.ly >= b.ly + b.height - 1e-9) U = std::min(U, o.ly - (b.ly + b.height));
+                }
+            }
+            double maxW = b.width  + std::max(0.0, L) + std::max(0.0, R);
+            double maxH = b.height + std::max(0.0, D) + std::max(0.0, U);
+            double ext = std::sqrt(std::max(maxW * maxH, b.area)) - std::sqrt(b.area);
+
+            const double* r = b.ft.rate;
+            auto nets_at = [&](double rate) { return rate > 0 ? ext * 50.0 / rate : 1e18; };
+            double cap = std::min(nets_at(r[0]), 3000.0);
+            double n1 = nets_at(r[1]); if (n1 > 3000.0) cap = std::max(cap, std::min(n1, 6000.0));
+            double n2 = nets_at(r[2]); if (n2 > 6000.0) cap = std::max(cap, std::min(n2, 9000.0));
+            double n3 = nets_at(r[3]); if (n3 > 9000.0) cap = std::max(cap, n3);
+            ft_cap[i] = cap;
+        }
     }
 
     // Build directed face-graph with channel penalties for congestion avoidance.
@@ -104,8 +148,10 @@ public:
                         // module to grow (FT area conversion).  Charge a heavy
                         // multiplier so the router prefers routing AROUND through
                         // channels, and only feeds through as a last resort when
-                        // no channel path exists.
-                        cost *= FT_TRAVERSE_PENALTY;
+                        // no channel path exists.  Blocks under relief are priced
+                        // out (connectivity preserved — no FAIL risk).
+                        cost *= cfg::FT_TRAVERSE_PENALTY;
+                        if (ft_relief.count(i)) cost *= 1e9;
                     }
                     adj[face_enter(i, ein)].push_back({face_exit(i, eout), cost});
                 }
@@ -223,11 +269,86 @@ public:
             dems.swap(next);
         }
 
-        // Adopt the best-overflow routing and recompute channel usage from it.
+        // Surgical artery relief, then adopt the routing and recompute usage.
+        relief_pass(d, best_paths);
         d.paths = best_paths;
         for (auto& ch : d.channels) { ch.nets_x = 0; ch.nets_y = 0; }
         for (auto& p : d.paths) accum_nets(p, p.nets, d);
         return best_ok;
+    }
+
+    // ─── Artery relief pass ─────────────────────────────────────────────────
+    // One-shot and surgical: blocks whose final FT load exceeds what their
+    // surrounding whitespace can absorb (ft_cap) get their interiors priced
+    // out, and ONLY the paths crossing them are re-routed.  The result is
+    // kept only if the penalty-aligned badness improves.  Unlike in-anneal
+    // load feedback (which measurably oscillated and regressed 3-5x), this
+    // cannot make the routing worse.
+    void relief_pass(Design& d, std::vector<RoutePath>& paths) {
+        auto load = soft_loads(paths);
+        std::set<std::string> over;
+        for (int i = 0; i < n_blocks; i++)
+            if (load[i] > ft_cap[i] + 1e-9) { over.insert(rects[i].name); ft_relief.insert(i); }
+        if (over.empty()) return;
+
+        auto recompute = [&](std::vector<RoutePath>& ps) {
+            for (auto& ch : d.channels) { ch.nets_x = 0; ch.nets_y = 0; }
+            for (auto& p : ps) accum_nets(p, p.nets, d);
+        };
+        recompute(paths);
+        double before = routing_badness(d, paths);
+
+        auto adj = build_adj();   // with relief pricing
+        ft_relief.clear();
+
+        std::vector<RoutePath> cand = paths;
+        for (auto& p : cand) {
+            if (p.segments.size() < 3) continue;
+            bool crosses = false;
+            for (size_t k = 1; k + 1 < p.segments.size(); k++)
+                if (over.count(p.segments[k].rect_name)) { crosses = true; break; }
+            if (!crosses) continue;
+            auto fi = name_to_idx.find(p.segments.front().rect_name);
+            auto ti = name_to_idx.find(p.segments.back().rect_name);
+            if (fi == name_to_idx.end() || ti == name_to_idx.end()) continue;
+            auto np = route_one(fi->second, ti->second, (int)p.nets, adj, d);
+            if (!np.segments.empty()) p = np;
+        }
+        recompute(cand);
+        double after = routing_badness(d, cand);
+        if (after < before - 1e-6) paths.swap(cand);
+        recompute(paths);
+    }
+
+    // Per-SOFT-block feedthrough nets implied by a set of paths.
+    std::vector<double> soft_loads(const std::vector<RoutePath>& paths) const {
+        std::vector<double> load(n_blocks, 0.0);
+        for (auto& p : paths) {
+            for (size_t k = 1; k + 1 < p.segments.size(); k++) {
+                auto it = name_to_idx.find(p.segments[k].rect_name);
+                if (it != name_to_idx.end() && it->second < n_blocks &&
+                    rects[it->second].allow_ft)
+                    load[it->second] += p.nets;
+            }
+        }
+        return load;
+    }
+
+    // Penalty-count-aligned routing badness: the evaluator charges one penalty
+    // per overflowing channel-direction and one per unsatisfiable soft block,
+    // independent of magnitude — count first, excess nets as tie-break.
+    double routing_badness(const Design& d, const std::vector<RoutePath>& paths) const {
+        int cnt = 0;
+        double mag = 0;
+        for (auto& ch : d.channels) {
+            double ox = ch.nets_x - ch.cap_x(), oy = ch.nets_y - ch.cap_y();
+            if (ox > 1e-9) { cnt++; mag += ox; }
+            if (oy > 1e-9) { cnt++; mag += oy; }
+        }
+        auto load = soft_loads(paths);
+        for (int i = 0; i < n_blocks; i++)
+            if (load[i] > ft_cap[i] + 1e-9) { cnt++; mag += load[i] - ft_cap[i]; }
+        return cnt * 1e7 + mag;
     }
 
     // Dijkstra over face-graph; targets any entry face of destination.

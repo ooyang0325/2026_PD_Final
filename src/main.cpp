@@ -6,6 +6,7 @@
 #include "sa_optimizer.h"
 #include "legalize_loop.h"
 #include "analytical_legalizer.h"
+#include "inplace_expand.h"
 #include "output.h"
 #include "config.h"
 #include <iostream>
@@ -80,9 +81,11 @@ static double compute_final_cost(const Design& d) {
 // Run one complete solve cycle. Returns final cost (without overflow penalty).
 // Modifies d with the result (block positions, paths, channels).
 // Flow: coarse SA -> fine SA -> 4x (route -> FT expand via full repack -> finalize).
-static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned seed1, unsigned seed2) {
+static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned seed1, unsigned seed2,
+                       bool shape_terms = true) {
     Design d = d_in;
     Floorplan fp(d);
+    if (!shape_terms) { fp.ftcw = 0.0; fp.moatw = 0.0; }
 
     // Full finalize: pack + snap edge blocks to the compact boundary + recompute channels.
     // Only call this for the final output step to avoid snap-induced overlaps during
@@ -115,7 +118,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
 
     auto route_now = [&]() {
         GlobalRouter gr;
-        gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
+        gr.init(d.blocks, d.channels, d.outline.cur_width, d.outline.cur_height);
         gr.route_all(d, 20);
     };
 
@@ -201,7 +204,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
     const double PEN   = 1e10;
     auto route_and_score = [&]() {
         GlobalRouter gr;
-        gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
+        gr.init(d.blocks, d.channels, d.outline.cur_width, d.outline.cur_height);
         gr.route_all(d, 20);
         collect_ft();
 
@@ -307,6 +310,43 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                 }
             }
         }
+        // ── In-place FT expansion ────────────────────────────────────────────
+        // Grow undersized soft blocks into adjacent whitespace (no repack),
+        // re-route, and keep only strict improvements.  This is the only
+        // expansion path that works once the packing spans the full outline;
+        // the repack-based ones (legacy loop, LegalizeLoop EXPAND) go
+        // out-of-outline and roll back.  Coordinates are authoritative after
+        // this point, matching the analytical-pass contract.
+        if (have_best && cfg::EXP_ENABLE) {
+            printf("[InplaceExpand] Starting with score %.3f\n", best_score);
+            for (int it = 0; it < cfg::EXP_ITERS; it++) {
+                auto snap_blocks = d.blocks;
+                auto snap_chs    = d.channels;
+                auto snap_paths  = d.paths;
+                auto snap_W      = fp.W;
+                auto snap_H      = fp.H;
+                auto snap_ft     = fp.ft_nets;
+
+                if (inplace::expand_pass(d, fp) == 0) break;
+                d.channels = ChannelCalculator::compute(
+                    d.blocks, d.outline.cur_width, d.outline.cur_height);
+
+                bool ok = is_valid();
+                double s = ok ? route_and_score() : 1e30;
+                if (ok && s < best_score - 1.0) {
+                    best_score = s;
+                    continue; // routes shifted: re-collect deficits and retry
+                }
+                d.blocks = snap_blocks;
+                d.channels = snap_chs;
+                d.paths = snap_paths;
+                fp.W = snap_W;
+                fp.H = snap_H;
+                fp.ft_nets = snap_ft;
+                break;
+            }
+            printf("[InplaceExpand] Done, score %.3f\n", best_score);
+        }
     } else {
         // Legacy global-expand convergence (kept for A/B testing via FP_LEG_ENABLE=0).
         // Records best valid state across rounds so an expansion that overshoots
@@ -383,7 +423,8 @@ static unsigned mix_seed(unsigned base, unsigned idx) {
 
 static std::pair<double, Design> run_search(const Design& d,
                                             double time_limit,
-                                            unsigned seed_base) {
+                                            unsigned seed_base,
+                                            bool shape_terms = true) {
     auto t0 = std::chrono::steady_clock::now();
     auto elapsed = [&]() {
         return std::chrono::duration<double>(
@@ -408,7 +449,7 @@ static std::pair<double, Design> run_search(const Design& d,
         unsigned seed2 = mix_seed(seed_base, (unsigned)(restart * 2 + 1));
 
         Design trial = d;
-        double cost = run_once(trial, sa1_t, sa2_t, seed1, seed2);
+        double cost = run_once(trial, sa1_t, sa2_t, seed1, seed2, shape_terms);
 
         if (cost < best_cost) {
             best_cost = cost;
@@ -461,8 +502,12 @@ int main(int argc, char* argv[]) {
 
     for (int w = 0; w < workers; w++) {
         unsigned seed_base = 12345u + (unsigned)w * 101u;
+        // Portfolio: odd workers anneal with the artery/moat shape terms,
+        // even workers without.  The penalty-aware best-score selection below
+        // picks whichever strategy suits the case.
+        bool shape_terms = (w % 2 == 1);
         futures.push_back(std::async(std::launch::async, [=]() {
-            return run_search(d, time_limit, seed_base);
+            return run_search(d, time_limit, seed_base, shape_terms);
         }));
     }
 
