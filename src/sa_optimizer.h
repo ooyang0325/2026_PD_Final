@@ -3,6 +3,7 @@
 #include "ft_estimator.h"
 #include "config.h"
 #include "channel.h"
+#include "router.h"
 #include <random>
 #include <cmath>
 #include <iostream>
@@ -28,6 +29,55 @@ public:
     double time_limit_sec = 6000.0;
 
     SAOptimizer(Floorplan& fp_, unsigned seed = 42) : fp(fp_), rng(seed) {}
+
+    // Routed-feedback checkpoint: route the best layout so far with the REAL
+    // router (cheap rip-up budget) and mark soft blocks whose routed load
+    // exceeds their whitespace-absorbable capacity (GlobalRouter::ft_cap).
+    // The line-of-sight estimate the anneal otherwise relies on under-counts
+    // routed wandering, so arteries survive it — this is the only signal that
+    // doesn't.  Marks change the cost landscape, so both cost anchors are
+    // recomputed before the anneal resumes.
+    void routed_feedback(const BStarTree::State& best_tree,
+                         const std::vector<double>& best_W,
+                         const std::vector<double>& best_H,
+                         const std::vector<int>& best_loc,
+                         double& cur_cost, double& best_cost,
+                         double alpha, double max_w, double max_h) {
+        BStarTree::State cur = fp.bst.save();
+        std::vector<double> curW = fp.W, curH = fp.H;
+        std::vector<int> cur_loc = fp.active_loc;
+
+        fp.bst.restore(best_tree);
+        fp.W = best_W; fp.H = best_H;
+        fp.active_loc = best_loc;
+        fp.pack(); // commit coords so channels/routing see the best layout
+
+        fp.d.channels = ChannelCalculator::compute(fp.d.blocks, max_w, max_h);
+        GlobalRouter gr;
+        gr.init(fp.d.blocks, fp.d.channels, max_w, max_h);
+        gr.route_all(fp.d, 2);
+        auto load = gr.soft_loads(fp.d.paths);
+
+        fp.artery_marks.clear();
+        for (int i = 0; i < (int)load.size(); i++) {
+            double cap = std::max(1.0, gr.ft_cap[i]);
+            if (load[i] > cap) {
+                double sev = std::min(2.0, (load[i] - cap) / cap);
+                fp.artery_marks.push_back({i,
+                    fp.d.blocks[i].lx + fp.d.blocks[i].width  * 0.5,
+                    fp.d.blocks[i].ly + fp.d.blocks[i].height * 0.5,
+                    sev});
+            }
+        }
+
+        auto [bw, bh] = fp.eval(); // still the best state
+        best_cost = fp.compute_cost(bw, bh, alpha, max_w, max_h);
+        fp.bst.restore(cur);
+        fp.W = curW; fp.H = curH;
+        fp.active_loc = cur_loc;
+        auto [cw, ch] = fp.eval();
+        cur_cost = fp.compute_cost(cw, ch, alpha, max_w, max_h);
+    }
 
     void run() {
         auto t0 = std::chrono::steady_clock::now();
@@ -123,6 +173,11 @@ public:
 
         int iter = 0;
         double T = T_init;
+        // Routed-feedback checkpoints at fixed budget fractions (mid/late
+        // anneal, when the layout is stable enough for routing to mean
+        // something).  Each costs ~1-2s of routing, so skip on tiny budgets.
+        double next_rfb = 0.35;
+        bool rfb_on = cfg::RFBW > 0.0 && time_limit_sec >= 15.0;
 
         while (elapsed() < time_limit_sec) {
             // Soft blocks stay at BASE area during the SA so a fitting layout
@@ -221,6 +276,12 @@ public:
             double t_frac = std::min(1.0, elapsed() / time_limit_sec);
             T = T_init * std::pow(T_final / T_init, t_frac);
             iter++;
+
+            if (rfb_on && t_frac >= next_rfb && next_rfb < 0.9) {
+                next_rfb += 0.20;
+                routed_feedback(best_tree, best_W, best_H, best_loc,
+                                cur_cost, best_cost, alpha, max_w, max_h);
+            }
 
             if (iter % 50000 == 0) {
                 std::cerr << "[SA] iter=" << iter << " T=" << T

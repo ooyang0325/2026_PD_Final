@@ -26,6 +26,13 @@ inline double FT_EST_CAP         = 3000.0;
 // connected blocks to the same side fixes it (the b50u65 "moat" failure).
 inline double MOATW              = 10.0;
 
+// Routed-feedback weight: at checkpoints during the anneal the REAL router
+// runs on the best layout so far, and soft blocks it overloads beyond their
+// whitespace-absorbable capacity become positional repulsion marks in the SA
+// cost.  This is the only artery signal not filtered through the line-of-
+// sight estimate (which under-counts routed wandering).  0 disables.
+inline double RFBW               = 6.0;
+
 // Route-driven legalize loop (post-SA refinement).
 inline int    LEG_ITERS          = 128;   // max outer iterations
 inline double LEG_TIME           = 30.0; // wall-clock cap (seconds)
@@ -63,6 +70,7 @@ inline void load_from_env() {
     if (const char* e = std::getenv("FP_FTCW"))    FTCW = std::atof(e);
     if (const char* e = std::getenv("FP_FTEC"))    FT_EST_CAP = std::atof(e);
     if (const char* e = std::getenv("FP_MOATW"))   MOATW = std::atof(e);
+    if (const char* e = std::getenv("FP_RFBW"))    RFBW = std::atof(e);
     if (const char* e = std::getenv("FP_LEG_ITERS")) LEG_ITERS  = std::atoi(e);
     if (const char* e = std::getenv("FP_LEG_TIME"))  LEG_TIME   = std::atof(e);
     if (const char* e = std::getenv("FP_LEG_TRIES")) LEG_TRIES  = std::atoi(e);

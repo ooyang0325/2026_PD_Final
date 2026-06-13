@@ -55,6 +55,13 @@ public:
     struct CutEv { double pos; double dcap; double ddem; };
     mutable std::vector<CutEv> cut_evs;
 
+    // Routed-feedback artery marks: blocks the REAL router overloaded beyond
+    // their absorbable capacity, recorded with the position where it happened.
+    // The SA cost repels a marked block from its marked spot — an
+    // estimate-free signal (set at checkpoints by the SA, see sa_optimizer.h).
+    struct ArteryMark { int blk; double px, py; double sev; };
+    std::vector<ArteryMark> artery_marks;
+
     Floorplan(Design& d_) : d(d_), bst((int)d_.blocks.size()),
         W(d_.blocks.size()), H(d_.blocks.size()),
         rotatable(d_.blocks.size(), false),
@@ -227,6 +234,20 @@ public:
             double ox = cut_overflow_axis(true,  chip_w, chip_h);
             double oy = cut_overflow_axis(false, chip_w, chip_h);
             penalty += moatw * (ox / (25.0 * chip_h) + oy / (25.0 * chip_w));
+        }
+
+        // Routed-feedback repulsion: a marked block sitting near the spot
+        // where the real router overloaded it keeps becoming an artery —
+        // push it away; whoever replaces it has different size/capacity and
+        // the next checkpoint re-judges the result.
+        if (cfg::RFBW > 0.0 && !artery_marks.empty()) {
+            double R = 0.25 * (max_w + max_h);
+            for (const auto& m : artery_marks) {
+                double cx = bst.x[m.blk] + W[m.blk] * 0.5;
+                double cy = bst.y[m.blk] + H[m.blk] * 0.5;
+                double dist = std::abs(cx - m.px) + std::abs(cy - m.py);
+                if (dist < R) penalty += cfg::RFBW * m.sev * (1.0 - dist / R);
+            }
         }
 
         penalty += edge_block_penalty(max_w, max_h);
