@@ -3,6 +3,7 @@
 #include "floorplan.h"
 #include "channel.h"
 #include "router.h"
+#include "partitioner.h"
 #include "sa_optimizer.h"
 #include "legalize_loop.h"
 #include "analytical_legalizer.h"
@@ -82,10 +83,19 @@ static double compute_final_cost(const Design& d) {
 // Modifies d with the result (block positions, paths, channels).
 // Flow: coarse SA -> fine SA -> 4x (route -> FT expand via full repack -> finalize).
 static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned seed1, unsigned seed2,
-                       bool shape_terms = true) {
+                       bool shape_terms = true, bool use_partition = false) {
     Design d = d_in;
     Floorplan fp(d);
     if (!shape_terms) { fp.ftcw = 0.0; fp.moatw = 0.0; }
+
+    // ── Pre-SA partitioning stage ─────────────────────────────────────────────
+    // Seed the initial B*-tree from a congestion-aware recursive min-cut bisection
+    // (see partitioner.h).  This is a PORTFOLIO member, not a global mode: only a
+    // subset of workers partition-seed (decided in main), and a pure-blind worker
+    // always runs, so the penalty-aware best-of selection can never let the
+    // partition make the final solution worse — it can only win when its start
+    // anneals to something better.  Seeded with seed1 for per-worker diversity.
+    if (use_partition) partition::seed(fp, seed1);
 
     // Full finalize: pack + snap edge blocks to the compact boundary + recompute channels.
     // Only call this for the final output step to avoid snap-induced overlaps during
@@ -125,14 +135,21 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
     // ── SA phase 1 ──────────────────────────────────────────────────────────
     SAOptimizer sa(fp, seed1);
     sa.time_limit_sec = sa1_time;
+    sa.preserve_start = use_partition; // keep the partition seed as the anneal start
     sa.run();
     finalize_output();
 
     // ── SA phase 2 (fine) ───────────────────────────────────────────────────
     // Pack at base area to satisfy the fixed outline; the convergence loop below
-    // sizes soft blocks to the real feedthrough.
+    // sizes soft blocks to the real feedthrough.  Phase 2 ALWAYS resamples (no
+    // preserve_start, even for partition workers): phase 1 commits to the
+    // partition basin, but phase 2 is a free fine-tune that can escape it — e.g.
+    // break the column structure if a more compact / less channel-funneling
+    // arrangement scores better.  This is the safety valve against the partition
+    // seed pinning the anneal into a routing-pathological column layout.
     SAOptimizer sa2(fp, seed2);
     sa2.time_limit_sec = sa2_time;
+    sa2.preserve_start = false;
     sa2.run();
     finalize_output();
 
@@ -243,64 +260,60 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
             loop.max_iters      = cfg::LEG_ITERS;
             // Scale with the restart slice so multi-restart schedules don't
             // multiply the (unbudgeted) legalize wall time.
-            loop.max_seconds    = std::min(cfg::LEG_TIME, sa1_time + sa2_time);
+            // Deterministic harness: bound by iterations only (huge time cap) so
+            // the legalize loop is reproducible; production scales with the slice.
+            loop.max_seconds    = (cfg::SA_ITERS > 0) ? 1e9
+                                  : std::min(cfg::LEG_TIME, sa1_time + sa2_time);
+            // ...but cap the iteration count in harness mode so the (otherwise
+            // time-bounded) loop still finishes quickly at high SA move budgets.
+            if (cfg::SA_ITERS > 0) loop.max_iters = std::min(cfg::LEG_ITERS, 24);
             loop.displace_tries = cfg::LEG_TRIES;
             best_score = loop.run();
             have_best  = is_valid();
         }
 
-        // ── Final-pass analytical legalizer ──────────────────────────────────
+        // ── Final-pass analytical legalizer (multi-attempt, escalating) ──────
         // Force-directed redistribution within the current compact outline.
-        // Breaks the B*-tree by design (user-approved): operates directly on
-        // (lx, ly) coordinates.  Strict rollback if it doesn't improve.
+        // Breaks the B*-tree by design (user-approved): operates on (lx, ly).
+        // Run as several INDEPENDENTLY GATED attempts with increasing spreading
+        // strength.  The legalizer's density grid treats every overflowed
+        // channel as a congestion source, so each attempt pushes blocks OFF the
+        // overloaded channels — widening them and creating the even routing
+        // spacing the layout otherwise lacks.  A stronger spread that does not
+        // strictly cut the penalty score (or goes invalid) is rolled back, so
+        // escalation can only help, never regress.  Accepted attempts compound
+        // (each starts from the current best).
         if (have_best && cfg::ANA_ENABLE) {
             printf("[Analytical] Starting with score %.3f\n", best_score);
-            // Snapshot the full pre-analytical state.
-            auto snap_bst    = fp.bst.save();
-            auto snap_W      = fp.W;
-            auto snap_H      = fp.H;
-            auto snap_loc    = fp.active_loc;
-            auto snap_ft     = fp.ft_nets;
-            auto snap_blocks = d.blocks;
-            auto snap_chs    = d.channels;
-            auto snap_paths  = d.paths;
-            auto snap_outl   = d.outline;
-            double snap_score = best_score;
 
-            // Run the analytical pass.  It only mutates d.blocks[i].lx/ly for
-            // non-pinned blocks (and ONLY clips within d.outline.cur_*).
-            AnalyticalLegalizer ana(fp, d);
-            ana.iterations = cfg::ANA_ITERS;
-            ana.step_frac  = cfg::ANA_STEP;
-            ana.repel_w    = cfg::ANA_REPEL;
-            bool moved = ana.run();
+            auto try_analytical = [&](double step, double cong, int iters) -> bool {
+                auto snap_bst    = fp.bst.save();
+                auto snap_W      = fp.W;
+                auto snap_H      = fp.H;
+                auto snap_loc    = fp.active_loc;
+                auto snap_ft     = fp.ft_nets;
+                auto snap_blocks = d.blocks;
+                auto snap_chs    = d.channels;
+                auto snap_paths  = d.paths;
+                auto snap_outl   = d.outline;
+                double snap_score = best_score;
 
-            if (moved) {
-                // Recompute channels from the new coords WITHOUT B*-tree pack
-                // (the tree is now stale; coords are authoritative).  Outline
-                // stays at the pre-analytical compact value — the legalizer
-                // clipped within it so the max extent fits.
-                d.channels = ChannelCalculator::compute(
-                    d.blocks, d.outline.cur_width, d.outline.cur_height);
-
-                if (is_valid()) {
-                    double new_score = route_and_score();
-                    if (new_score < snap_score - 1.0) {
-                        best_score = new_score; // accept
-                    } else {
-                        // Rollback — analytical didn't help.
-                        fp.bst.restore(snap_bst);
-                        fp.W = snap_W; fp.H = snap_H;
-                        fp.active_loc = snap_loc;
-                        fp.ft_nets = snap_ft;
-                        d.blocks = snap_blocks;
-                        d.channels = snap_chs;
-                        d.paths = snap_paths;
-                        d.outline = snap_outl;
+                AnalyticalLegalizer ana(fp, d);
+                ana.iterations = iters;
+                ana.step_frac  = step;
+                ana.cong_w     = cong;
+                bool ok = false;
+                if (ana.run()) {
+                    // Coords are authoritative now (tree stale); recompute
+                    // channels within the compact outline and re-score.
+                    d.channels = ChannelCalculator::compute(
+                        d.blocks, d.outline.cur_width, d.outline.cur_height);
+                    if (is_valid()) {
+                        double new_score = route_and_score();
+                        if (new_score < snap_score - 1.0) { best_score = new_score; ok = true; }
                     }
-                } else {
-                    // Invalid layout (overlap left after MTV resolution, or
-                    // out-of-outline) — rollback.
+                }
+                if (!ok) {
                     fp.bst.restore(snap_bst);
                     fp.W = snap_W; fp.H = snap_H;
                     fp.active_loc = snap_loc;
@@ -310,7 +323,26 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                     d.paths = snap_paths;
                     d.outline = snap_outl;
                 }
-            }
+                return ok;
+            };
+
+            // Escalating spread strength: (step fraction of a grid cell,
+            // congestion-source weight, iterations).  The first entry is the
+            // historical mild setting; later entries spread harder to break the
+            // compact, channel-starved knots a mild pass cannot move.
+            const double bs = cfg::ANA_STEP;
+            const int    bi = cfg::ANA_ITERS;
+            struct AnaCfg { double step, cong; int iters; };
+            const AnaCfg sched[] = {
+                { bs,         100.0,  bi },
+                { bs *  3.0,  300.0,  std::max(32, bi * 3 / 4) },
+                { bs *  6.0,  700.0,  std::max(24, bi / 2) },
+                { bs * 10.0, 1500.0,  std::max(16, bi / 2) },
+            };
+            int npass = std::max(1, std::min((int)(sizeof(sched)/sizeof(sched[0])),
+                                             cfg::ANA_PASSES));
+            for (int k = 0; k < npass; k++)
+                try_analytical(sched[k].step, sched[k].cong, sched[k].iters);
         }
         // ── In-place FT expansion ────────────────────────────────────────────
         // Grow undersized soft blocks into adjacent whitespace (no repack),
@@ -426,12 +458,25 @@ static unsigned mix_seed(unsigned base, unsigned idx) {
 static std::pair<double, Design> run_search(const Design& d,
                                             double time_limit,
                                             unsigned seed_base,
-                                            bool shape_terms = true) {
+                                            bool shape_terms = true,
+                                            bool use_partition = false) {
     auto t0 = std::chrono::steady_clock::now();
     auto elapsed = [&]() {
         return std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t0).count();
     };
+
+    // Deterministic harness: a single iteration-bounded draw (SA termination is
+    // by move count, not wall clock), making the whole result a pure function of
+    // the seed — so a downstream knob change is a clean A/B, not a coin flip
+    // against SA noise.
+    if (cfg::SA_ITERS > 0) {
+        Design trial = d;
+        double cost = run_once(trial, 0.0, 0.0,
+                               mix_seed(seed_base, 0), mix_seed(seed_base, 1),
+                               shape_terms, use_partition);
+        return {cost, trial};
+    }
 
     double total_budget = time_limit * 0.95;
     const double min_restart = 10.0;
@@ -462,7 +507,7 @@ static std::pair<double, Design> run_search(const Design& d,
         unsigned seed2 = mix_seed(seed_base, (unsigned)(restart * 2 + 1));
 
         Design trial = d;
-        double cost = run_once(trial, sa1_t, sa2_t, seed1, seed2, shape_terms);
+        double cost = run_once(trial, sa1_t, sa2_t, seed1, seed2, shape_terms, use_partition);
 
         if (cost < best_cost) {
             best_cost = cost;
@@ -509,18 +554,25 @@ int main(int argc, char* argv[]) {
     unsigned hc = std::thread::hardware_concurrency();
     int workers = (hc > 2) ? (int)hc - 2 : 1;
     if (workers < 1) workers = 1;
+    if (cfg::WORKERS > 0) workers = cfg::WORKERS; // harness / reproducibility override
 
     std::vector<std::future<std::pair<double, Design>>> futures;
     futures.reserve((size_t)workers);
 
     for (int w = 0; w < workers; w++) {
         unsigned seed_base = 12345u + (unsigned)w * 101u;
-        // Portfolio: odd workers anneal with the artery/moat shape terms,
-        // even workers without.  The penalty-aware best-score selection below
-        // picks whichever strategy suits the case.
-        bool shape_terms = (w % 2 == 1);
+        // Portfolio over two independent strategy bits (cycles every 4 workers):
+        //   shape_terms  (w%2): anneal with the artery/moat shape terms or not.
+        //   use_partition(w%4>=2): seed the B*-tree from the congestion-aware
+        //                          partition (+preserve_start) or use the blind seed.
+        // w=0 is ALWAYS pure blind / no-shape, so the penalty-aware best-of below
+        // always has a non-partition baseline to fall back on — the partition can
+        // win a case but can never make the final solution worse.  Partition is
+        // tried once >=3 workers exist; gated off entirely by cfg::PART_ENABLE.
+        bool shape_terms   = (w % 2 == 1);
+        bool use_partition = (cfg::PART_ENABLE != 0) && ((w % 4) >= 2);
         futures.push_back(std::async(std::launch::async, [=]() {
-            return run_search(d, time_limit, seed_base, shape_terms);
+            return run_search(d, time_limit, seed_base, shape_terms, use_partition);
         }));
     }
 

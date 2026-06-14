@@ -34,6 +34,9 @@ struct Slack { double L = 0, R = 0, D = 0, U = 0; };
 
 inline Slack slack_of(const Design& d, int i) {
     const Block& b = d.blocks[i];
+    // Reserve a routable channel against neighbour blocks (cm), but allow growth
+    // right up to the die edge (no channel needed there).
+    const double cm = cfg::CHMIN;
     Slack s;
     s.L = b.lx;
     s.R = d.outline.cur_width  - (b.lx + b.width);
@@ -45,12 +48,12 @@ inline Slack slack_of(const Design& d, int i) {
         bool yo = o.ly < b.ly + b.height - 1e-9 && o.ly + o.height > b.ly + 1e-9;
         bool xo = o.lx < b.lx + b.width  - 1e-9 && o.lx + o.width  > b.lx + 1e-9;
         if (yo) {
-            if (o.lx + o.width <= b.lx + 1e-9)      s.L = std::min(s.L, b.lx - (o.lx + o.width));
-            else if (o.lx >= b.lx + b.width - 1e-9) s.R = std::min(s.R, o.lx - (b.lx + b.width));
+            if (o.lx + o.width <= b.lx + 1e-9)      s.L = std::min(s.L, b.lx - (o.lx + o.width) - cm);
+            else if (o.lx >= b.lx + b.width - 1e-9) s.R = std::min(s.R, o.lx - (b.lx + b.width) - cm);
         }
         if (xo) {
-            if (o.ly + o.height <= b.ly + 1e-9)      s.D = std::min(s.D, b.ly - (o.ly + o.height));
-            else if (o.ly >= b.ly + b.height - 1e-9) s.U = std::min(s.U, o.ly - (b.ly + b.height));
+            if (o.ly + o.height <= b.ly + 1e-9)      s.D = std::min(s.D, b.ly - (o.ly + o.height) - cm);
+            else if (o.ly >= b.ly + b.height - 1e-9) s.U = std::min(s.U, o.ly - (b.ly + b.height) - cm);
         }
     }
     s.L = std::max(0.0, s.L); s.R = std::max(0.0, s.R);

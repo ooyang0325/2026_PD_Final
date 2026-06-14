@@ -51,6 +51,14 @@ inline double ANA_REPEL          = 8.0;  // repulsion-vs-attraction weight
 inline int    EXP_ENABLE         = 1;    // 0 = skip the in-place expansion pass
 inline int    EXP_ITERS          = 8;    // max grow→reroute rounds
 
+// Minimum routing channel (um) that soft-block growth leaves between a block and
+// each NEIGHBOR (the die edge needs none).  DEFAULT 0 (off): a uniform reservation
+// globally restricts FT growth and measured WORSE on b50u55 (27 vs 13 penalties) —
+// it starves growth everywhere to protect channels that may not be the binding
+// ones.  Kept as an env knob (FP_CHMIN) for experiments; the demand-aware channel
+// widening (gated) is the targeted replacement.
+inline double CHMIN              = 0.0;
+
 // Restarts per worker.  The legacy schedule (sa1 = 0.75 x remaining) gives one
 // restart regardless of budget; equal slices give every worker independent
 // draws — run-to-run penalty variance (7 vs 18 on b50u60) dwarfs the per-draw
@@ -60,6 +68,42 @@ inline int    RESTARTS           = 2;
 // Router: per-soft-block feedthrough load cap.  Loads at or below this stay in
 // the cheapest FT-rate tier; the router charges escalating cost above it.
 inline double FT_SOFT_CAP        = 3000.0;
+
+// ── Deterministic evaluation harness ─────────────────────────────────────────
+// Wall-clock-terminated SA makes every run non-reproducible (the iteration count
+// depends on machine speed), so single runs can't A/B a post-processing change
+// against the ±10-penalty SA noise.  With SA_ITERS>0 the SA instead runs EXACTLY
+// that many moves (temperature scheduled by move fraction) and the post-SA
+// legalize loop is bounded by iterations only, making the whole pipeline a pure
+// function of the seed.  WORKERS>0 forces the worker count (use 1 for a single
+// deterministic draw).  ANA_PASSES selects how many escalating analytical-
+// legalizer attempts to run (1 = the legacy single mild pass).  Production
+// leaves SA_ITERS=0 / WORKERS=0 (time-based, multi-worker).
+inline long   SA_ITERS           = 0;
+inline int    WORKERS            = 0;
+// Analytical-legalizer escalation count.  DEFAULT 1 (the proven single mild
+// pass): each extra escalating pass re-routes the layout, and routing dominates
+// the post-SA tail, so ANA_PASSES=4 multiplied wall time enough to blow the
+// budget.  The escalation is gated (can only cut penalties, never regress) and
+// kept behind this knob for harness A/B once a fast valid draw is available.
+inline int    ANA_PASSES         = 1;
+
+// ── Pre-SA partitioning stage ────────────────────────────────────────────────
+// A congestion-aware recursive min-cut bisection runs BEFORE simulated
+// annealing and seeds the initial B*-tree, so the SA starts from a layout where
+// (a) strongly-connected (high-net) blocks are already adjacent — relieving long
+// high-capacity connections — and (b) connectivity load is spread so no single
+// region is a dense knot competing for limited channel/feedthrough capacity.
+// The bipartition objective is EXPLICITLY dual-aware: it sums cut weight AND a
+// local-congestion-overload term (plus an area-balance term to keep the slicing
+// inside the fixed outline).  All terms are carried in "nets" units so the
+// weights are directly comparable to the cut.
+inline int    PART_ENABLE        = 1;     // 0 = skip partitioning (legacy seed)
+inline double PART_CONGW         = 0.6;   // local-congestion-overload weight
+inline double PART_BALW          = 0.4;   // area-balance weight (fit the outline)
+inline double PART_KCAP          = 25.0;  // channel-capacity proxy: nets per unit
+                                          // of region linear dimension (sqrt-area)
+inline int    PART_FMPASS        = 8;     // FM refinement passes per bipartition
 
 inline void load_from_env() {
     if (const char* e = std::getenv("FP_HALO"))    HALO = std::atof(e);
@@ -77,8 +121,17 @@ inline void load_from_env() {
     if (const char* e = std::getenv("FP_LEG_ENABLE")) LEG_ENABLE = std::atoi(e);
     if (const char* e = std::getenv("FP_EXP_ENABLE")) EXP_ENABLE = std::atoi(e);
     if (const char* e = std::getenv("FP_EXP_ITERS"))  EXP_ITERS  = std::atoi(e);
+    if (const char* e = std::getenv("FP_CHMIN"))      CHMIN      = std::atof(e);
+    if (const char* e = std::getenv("FP_SA_ITERS"))   SA_ITERS   = std::atol(e);
+    if (const char* e = std::getenv("FP_WORKERS"))    WORKERS    = std::atoi(e);
+    if (const char* e = std::getenv("FP_ANA_PASSES")) ANA_PASSES = std::atoi(e);
     if (const char* e = std::getenv("FP_RESTARTS"))   RESTARTS   = std::atoi(e);
     if (const char* e = std::getenv("FP_FT_CAP"))     FT_SOFT_CAP = std::atof(e);
+    if (const char* e = std::getenv("FP_PART_ENABLE")) PART_ENABLE = std::atoi(e);
+    if (const char* e = std::getenv("FP_PART_CONGW"))  PART_CONGW  = std::atof(e);
+    if (const char* e = std::getenv("FP_PART_BALW"))   PART_BALW   = std::atof(e);
+    if (const char* e = std::getenv("FP_PART_KCAP"))   PART_KCAP   = std::atof(e);
+    if (const char* e = std::getenv("FP_PART_FMPASS")) PART_FMPASS = std::atoi(e);
 }
 
 } // namespace cfg

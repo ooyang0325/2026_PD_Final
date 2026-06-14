@@ -134,6 +134,41 @@ public:
         insert_at(freed, p, (rng() & 1u), rng);
     }
 
+    // ── Seed from a column placement (pre-SA partitioning) ────────────────────
+    // Install a topology that realizes an ordered set of vertical COLUMNS, each
+    // an ordered (bottom->top) list of block ids.  Mapping to B*-tree semantics:
+    //   - within a column, blocks stack via the RIGHT-child spine (same x, the
+    //     skyline lifts each one above the previous): col[k] -rc-> col[k+1]
+    //   - columns are laid left-to-right by linking their BOTTOM blocks via the
+    //     LEFT-child spine (advance x): col[i].bottom -lc-> col[i+1].bottom
+    // Node id == block id here (blk is the identity), so the topology alone
+    // encodes the placement.  `cols` must contain every block id in 0..n-1
+    // exactly once; empty columns are skipped.  The packing is overlap-free for
+    // ANY such wiring (the B*-tree contour guarantee), so this can never produce
+    // an invalid seed — at worst columns of uneven width lift later columns.
+    void build_from_columns(const std::vector<std::vector<int>>& cols) {
+        std::fill(par.begin(), par.end(), -1);
+        std::fill(lc.begin(),  lc.end(),  -1);
+        std::fill(rc.begin(),  rc.end(),  -1);
+        for (int i = 0; i < n; i++) blk[i] = i;
+        root = -1;
+        int prev_bottom = -1;
+        for (const auto& col : cols) {
+            if (col.empty()) continue;
+            int bottom = col.front();
+            if (root < 0) root = bottom;
+            if (prev_bottom >= 0) { lc[prev_bottom] = bottom; par[bottom] = prev_bottom; }
+            for (size_t k = 0; k + 1 < col.size(); k++) {
+                rc[col[k]] = col[k + 1];
+                par[col[k + 1]] = col[k];
+            }
+            prev_bottom = bottom;
+        }
+        if (root < 0) root = (n > 0 ? 0 : -1);
+        stk.reserve(n);
+        placed.reserve(n);
+    }
+
     // ── Save / restore (selective use in SA) ─────────────────────────────────
     struct State { int root; std::vector<int> par, lc, rc, blk; };
     void save(State& s) const { s.root = root; s.par = par; s.lc = lc; s.rc = rc; s.blk = blk; }

@@ -28,6 +28,13 @@ public:
     int moves_per_temp = 300;
     double time_limit_sec = 6000.0;
 
+    // When true, the normalization sampler still estimates Anorm/Wnorm/Fnorm and
+    // the initial temperature, but does NOT replace the starting tree with the
+    // most-compact random sample — the incoming layout (e.g. a congestion-aware
+    // partition seed installed before run()) is kept as the anneal start.  Set
+    // by main when the pre-SA partitioning stage is enabled.
+    bool preserve_start = false;
+
     SAOptimizer(Floorplan& fp_, unsigned seed = 42) : fp(fp_), rng(seed) {}
 
     // Routed-feedback checkpoint: route the best layout so far with the REAL
@@ -126,7 +133,12 @@ public:
                 As.push_back(a); Ws.push_back(w); TWs.push_back(t1); THs.push_back(t2);
                 sumA += a; sumW += w; sumF += f;
                 double metric = a + alpha * w;
-                if (metric < best_metric) { best_metric = metric; best_start = fp.bst.save(); }
+                // Keep the most-compact sample as the start UNLESS a seed must be
+                // preserved (partition stage) — then best_start stays the seed and
+                // we restore to it below, having only used the samples for norms/T.
+                if (!preserve_start && metric < best_metric) {
+                    best_metric = metric; best_start = fp.bst.save();
+                }
             }
 
             fp.Anorm = std::max(1.0, sumA / samples);
@@ -179,7 +191,23 @@ public:
         double next_rfb = 0.35;
         bool rfb_on = cfg::RFBW > 0.0 && time_limit_sec >= 15.0;
 
-        while (elapsed() < time_limit_sec) {
+        // Deterministic harness: terminate by move count (reproducible) instead
+        // of wall clock when cfg::SA_ITERS>0, scheduling temperature by the move
+        // fraction.  rfb is skipped in this mode (it routes, lengthening the run
+        // and complicating reproducibility — the harness A/Bs post-processing).
+        const bool det = cfg::SA_ITERS > 0;
+        long total_moves = 0;
+        const long move_budget = std::max(1L, cfg::SA_ITERS);
+        if (det) rfb_on = false;
+        auto done = [&]() {
+            return det ? (total_moves >= move_budget) : (elapsed() >= time_limit_sec);
+        };
+        auto frac = [&]() {
+            return det ? std::min(1.0, (double)total_moves / (double)move_budget)
+                       : std::min(1.0, elapsed() / time_limit_sec);
+        };
+
+        while (!done()) {
             // Soft blocks stay at BASE area during the SA so a fitting layout
             // always exists (the validity anchor).  Feedthrough is handled two
             // ways instead: (1) the FTAFP estimate is folded into the cost as a
@@ -189,7 +217,8 @@ public:
             // keeps layouts that remain inside the outline.
 
             for (int m = 0; m < moves_per_temp; m++) {
-                if (elapsed() >= time_limit_sec) break;
+                if (done()) break;
+                total_moves++;
 
                 int mv = move_type(rng);
                 int bi = bidx(rng);
@@ -273,7 +302,7 @@ public:
                 }
             }
 
-            double t_frac = std::min(1.0, elapsed() / time_limit_sec);
+            double t_frac = frac();
             T = T_init * std::pow(T_final / T_init, t_frac);
             iter++;
 
