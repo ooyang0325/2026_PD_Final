@@ -84,13 +84,26 @@ public:
         enum Section { NONE, BLOCK, OUTLINE, ALPHA_SEC, CONN_HEADER, CONN_DATA } sec = NONE;
         std::vector<std::string> block_names;
         bool got_conn_col_header = false;
+        // The 2026-06-17 testcase format inserts a "PORT EDGE" column between
+        // LOCATION (col 6) and FT CONVERSION (cols 7+).  Detect it from the BLOCK
+        // header so FT rates are read from the correct columns (backward compatible
+        // with the old format, which has no PORT EDGE column).
+        bool has_port_edge = false;
 
         for (auto& row : rows) {
             if (row.empty()) continue;
             std::string c0 = trim(row[0]);
 
             // Section 判斷
-            if (c0 == "BLOCK") { sec = BLOCK; continue; }
+            if (c0 == "BLOCK") {
+                sec = BLOCK;
+                for (auto& cell : row) {            // detect optional PORT EDGE column
+                    std::string t = trim(cell);
+                    std::transform(t.begin(), t.end(), t.begin(), ::toupper);
+                    if (t.find("PORT EDGE") != std::string::npos) { has_port_edge = true; break; }
+                }
+                continue;
+            }
             if (c0 == "OUTLINE") { sec = OUTLINE; continue; }
 
             // 判斷是否為 alpha 列 (相容各種奇怪的 UTF-8 α 字元)
@@ -183,12 +196,22 @@ public:
                     }
                 }
 
-                // FT 轉換率
+                // PORT EDGE (col 7, new format only): 1=left,2=top,3=right,4=bottom; 0/empty=unrestricted
+                b.port_edge = 0;
+                if (has_port_edge && row.size() > 7 && !trim(row[7]).empty()) {
+                    try {
+                        int pe = std::stoi(trim(row[7]));
+                        if (pe >= 1 && pe <= 4) b.port_edge = pe;
+                    } catch (...) {}
+                }
+
+                // FT 轉換率 (cols shift right by 1 when PORT EDGE is present)
+                int ftc = has_port_edge ? 8 : 7;
                 double defaults[4] = {0.2, 0.4, 0.8, 1.0};
                 for (int k = 0; k < 4; k++) {
                     b.ft.rate[k] = defaults[k];
-                    if (row.size() > (size_t)(7+k) && !trim(row[7+k]).empty())
-                        b.ft.rate[k] = parse_pct(row[7+k]);
+                    if (row.size() > (size_t)(ftc+k) && !trim(row[ftc+k]).empty())
+                        b.ft.rate[k] = parse_pct(row[ftc+k]);
                 }
 
                 // 若只有 Area 則推導初始 W, H
