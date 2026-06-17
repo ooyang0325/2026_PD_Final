@@ -81,6 +81,11 @@ inline double FT_SOFT_CAP        = 3000.0;
 // leaves SA_ITERS=0 / WORKERS=0 (time-based, multi-worker).
 inline long   SA_ITERS           = 0;
 inline int    WORKERS            = 0;
+// Report instrumentation: when 1, run_once prints a parseable STAGEREPORT line
+// (fails / channel-pen / ft-pen / cost) after each post-processing stage, so a
+// benchmark harness can capture the per-stage pre/post penalty breakdown in a
+// single run.  Off in production.
+inline int    REPORT_STAGES      = 0;
 // Analytical-legalizer escalation count.  DEFAULT 1 (the proven single mild
 // pass): each extra escalating pass re-routes the layout, and routing dominates
 // the post-SA tail, so ANA_PASSES=4 multiplied wall time enough to blow the
@@ -125,6 +130,7 @@ inline void load_from_env() {
     if (const char* e = std::getenv("FP_SA_ITERS"))   SA_ITERS   = std::atol(e);
     if (const char* e = std::getenv("FP_WORKERS"))    WORKERS    = std::atoi(e);
     if (const char* e = std::getenv("FP_ANA_PASSES")) ANA_PASSES = std::atoi(e);
+    if (const char* e = std::getenv("FP_REPORT_STAGES")) REPORT_STAGES = std::atoi(e);
     if (const char* e = std::getenv("FP_RESTARTS"))   RESTARTS   = std::atoi(e);
     if (const char* e = std::getenv("FP_FT_CAP"))     FT_SOFT_CAP = std::atof(e);
     if (const char* e = std::getenv("FP_PART_ENABLE")) PART_ENABLE = std::atoi(e);

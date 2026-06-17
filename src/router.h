@@ -356,37 +356,55 @@ public:
                         const std::vector<std::vector<std::pair<int,double>>>& adj,
                         const Design& d) {
         int NF = (int)rects.size() * 8;
-        std::vector<double> dist(NF, 1e18);
-        std::vector<int> prev(NF, -1);
         using PD = std::pair<double,int>;
-        std::priority_queue<PD, std::vector<PD>, std::greater<PD>> pq;
 
-        // Source: start from all exit-faces of source block
-        for (int e = 1; e <= 4; e++) {
-            int f = face_exit(from_blk, e);
-            dist[f] = 0;
-            pq.push({0, f});
-        }
+        // Routing-port edges (0 = unrestricted): a net should leave the source block
+        // and arrive at the destination block through the declared port edge.
+        int nb = (int)d.blocks.size();
+        int base_src = (from_blk >= 0 && from_blk < nb) ? d.blocks[from_blk].port_edge : 0;
+        int base_dst = (to_blk   >= 0 && to_blk   < nb) ? d.blocks[to_blk].port_edge   : 0;
 
-        while (!pq.empty()) {
-            auto [d_cur, f_cur] = pq.top(); pq.pop();
-            if (d_cur > dist[f_cur] + 1e-9) continue;
+        // Attempt 0 honours the port edges; if that leaves the net unroutable
+        // (port face blocked by placement), attempt 1 relaxes them so the net is
+        // still connected (avoids a far worse routing-open) — at most one port
+        // deviation instead of an open net.
+        for (int attempt = 0; attempt < 2; attempt++) {
+            int src_pe = attempt == 0 ? base_src : 0;
+            int dst_pe = attempt == 0 ? base_dst : 0;
 
-            // Check if we reached any entry-face of destination
-            int ri = rect_of(f_cur);
-            bool is_enter = is_entry(f_cur);
-            if (is_enter && ri == to_blk && ri != from_blk) {
-                return reconstruct(from_blk, to_blk, f_cur, prev, nets);
+            std::vector<double> dist(NF, 1e18);
+            std::vector<int> prev(NF, -1);
+            std::priority_queue<PD, std::vector<PD>, std::greater<PD>> pq;
+
+            for (int e = 1; e <= 4; e++) {
+                if (src_pe != 0 && e != src_pe) continue;
+                int f = face_exit(from_blk, e);
+                dist[f] = 0;
+                pq.push({0, f});
             }
 
-            for (auto& [fn, cost] : adj[f_cur]) {
-                double nd = d_cur + cost;
-                if (nd < dist[fn]) {
-                    dist[fn] = nd;
-                    prev[fn] = f_cur;
-                    pq.push({nd, fn});
+            while (!pq.empty()) {
+                auto [d_cur, f_cur] = pq.top(); pq.pop();
+                if (d_cur > dist[f_cur] + 1e-9) continue;
+
+                int ri = rect_of(f_cur);
+                bool is_enter = is_entry(f_cur);
+                if (is_enter && ri == to_blk && ri != from_blk &&
+                    (dst_pe == 0 || edge_of(f_cur) == dst_pe)) {
+                    return reconstruct(from_blk, to_blk, f_cur, prev, nets);
+                }
+
+                for (auto& [fn, cost] : adj[f_cur]) {
+                    double nd = d_cur + cost;
+                    if (nd < dist[fn]) {
+                        dist[fn] = nd;
+                        prev[fn] = f_cur;
+                        pq.push({nd, fn});
+                    }
                 }
             }
+
+            if (base_src == 0 && base_dst == 0) break;  // nothing to relax
         }
 
         RoutePath empty; empty.nets = nets;

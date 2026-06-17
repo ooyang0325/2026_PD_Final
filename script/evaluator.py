@@ -1,8 +1,8 @@
 import sys
 import math
 import csv
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
+# matplotlib is imported lazily inside plot() so scoring works without it
+# (and without numpy) — the evaluator can score on machines lacking those.
 
 class Evaluator:
     def __init__(self, csv_file, cfg_file):
@@ -21,7 +21,8 @@ class Evaluator:
         
         self.fails = 0
         self.penalties = 0
-        
+        self.has_port_edge = False  # set when the CSV has the PORT EDGE column
+
         self.parse_csv()
         self.parse_cfg()
 
@@ -34,7 +35,10 @@ class Evaluator:
                     if not cols or all(c.strip() == '' for c in cols): continue
                     
                     c0 = cols[0].strip()
-                    if c0 == "BLOCK": stage = "BLOCK"; continue
+                    if c0 == "BLOCK":
+                        stage = "BLOCK"
+                        self.has_port_edge = any("PORT EDGE" in (c or "").upper() for c in cols)
+                        continue
                     elif c0 == "OUTLINE": stage = "OUTLINE"; continue
                     elif "α" in c0 or "alpha" in c0.lower(): 
                         self.alpha = float(cols[1].strip())
@@ -46,9 +50,21 @@ class Evaluator:
                         area = float(cols[1].strip()) if cols[1].strip() else 0.0
                         btype = cols[5].strip()
                         loc = cols[6].strip() if len(cols) > 6 else ""
-                        ft_rates = [float(x.strip().strip('%'))/100 for x in cols[7:11]] if len(cols) >= 11 and cols[7].strip() else [0.2, 0.4, 0.8, 1.0]
-                            
-                        self.blocks_info[name] = {"area": area, "type": btype, "loc": loc, "ft_rates": ft_rates}
+                        # PORT EDGE column (new format) shifts FT CONVERSION right by 1.
+                        port_edge = 0
+                        ftc = 7
+                        if self.has_port_edge:
+                            ftc = 8
+                            if len(cols) > 7 and cols[7].strip():
+                                try:
+                                    pe = int(float(cols[7].strip()))
+                                    if 1 <= pe <= 4: port_edge = pe
+                                except ValueError: pass
+                        ft_rates = ([float(x.strip().strip('%'))/100 for x in cols[ftc:ftc+4]]
+                                    if len(cols) >= ftc+4 and cols[ftc].strip()
+                                    else [0.2, 0.4, 0.8, 1.0])
+                        self.blocks_info[name] = {"area": area, "type": btype, "loc": loc,
+                                                  "port_edge": port_edge, "ft_rates": ft_rates}
                     
                     elif stage == "OUTLINE" and c0 == "MAX":
                         self.max_outline = (float(cols[1].strip()), float(cols[2].strip()))
@@ -143,19 +159,44 @@ class Evaluator:
             return (x, y)
         return (0, 0)
 
+    @staticmethod
+    def _third_iv(which, L):
+        # The equal-third (QA A10) selected by the 2nd LOCATION letter.
+        t3 = L / 3.0
+        if which in ('L', 'B'):   return (0.0, t3)      # left / bottom third
+        elif which in ('R', 'T'): return (2*t3, L)      # right / top third
+        else:                     return (t3, 2*t3)     # middle / unspecified
+
     def check_edge_location(self, name, b):
         loc_str = self.blocks_info[name]["loc"]
-        if not loc_str or loc_str == "NONE": return True
-        
-        options = [o.strip() for o in loc_str.split(',')]
-        for opt in options:
-            match = True
-            if 'T' in opt and abs(b['ly'] + b['h'] - self.out_outline[1]) > 1e-3: match = False
-            if 'B' in opt and abs(b['ly'] - 0.0) > 1e-3: match = False
-            if 'L' in opt and abs(b['lx'] - 0.0) > 1e-3: match = False
-            if 'R' in opt and abs(b['lx'] + b['w'] - self.out_outline[0]) > 1e-3: match = False
-            if match: return True
-        return False
+        if not loc_str or loc_str.upper() == "NONE": return True
+        W, H = self.out_outline
+        # Group LOCATION codes by their flush edge (1st letter).  The block must be
+        # flush to each named edge and its 1-D extent along that edge must OVERLAP
+        # the UNION of the thirds named for it (QA A19 overlap + A20 1-D).  Multiple
+        # same-edge codes describe the band the block spans, not separate hard
+        # constraints — e.g. a tall corner block 'LM,LT,TL' need only overlap the
+        # combined LM∪LT band on the left edge, which a flush corner placement does.
+        edges = {}
+        for code in [o.strip().upper() for o in loc_str.split(',') if o.strip()]:
+            e = code[0]; lo, hi = self._third_iv(code[1] if len(code) >= 2 else 'M',
+                                                 W if e in 'TB' else H)
+            cur = edges.get(e)
+            edges[e] = (min(cur[0], lo), max(cur[1], hi)) if cur else (lo, hi)
+        for e, (lo, hi) in edges.items():
+            if e == 'T':
+                if abs(b['ly'] + b['h'] - H) > 1e-3: return False
+                if min(b['lx']+b['w'], hi) - max(b['lx'], lo) <= 1e-3: return False
+            elif e == 'B':
+                if abs(b['ly']) > 1e-3: return False
+                if min(b['lx']+b['w'], hi) - max(b['lx'], lo) <= 1e-3: return False
+            elif e == 'L':
+                if abs(b['lx']) > 1e-3: return False
+                if min(b['ly']+b['h'], hi) - max(b['ly'], lo) <= 1e-3: return False
+            elif e == 'R':
+                if abs(b['lx'] + b['w'] - W) > 1e-3: return False
+                if min(b['ly']+b['h'], hi) - max(b['ly'], lo) <= 1e-3: return False
+        return True
 
     def evaluate(self):
         print("========== ICCAD 2026 Problem E 評測 ==========")
@@ -188,6 +229,23 @@ class Evaluator:
                 if not self.check_edge_location(name, b):
                     print(f"[FAIL] Edge constraint violation! {name} 未能放置在要求的邊界 {self.blocks_info[name]['loc']}")
                     self.fails += 1
+
+        # 3b. Check PORT EDGE constraint (QA A21/A22): a block with a declared port
+        # edge must have its nets enter/leave through that edge (checked at the path
+        # endpoints — the source out-edge and target in-edge).
+        port_violations = set()
+        for p in self.paths:
+            ri = p["route_info"]
+            for endpoint, ekey in ((ri[0], "out"), (ri[-1], "in")):
+                nm = endpoint["name"]
+                info = self.blocks_info.get(nm)
+                if not info: continue
+                pe = info.get("port_edge", 0)
+                if pe and endpoint[ekey] is not None and str(endpoint[ekey]).strip() != str(pe):
+                    port_violations.add((nm, str(endpoint[ekey]).strip(), pe))
+        for nm, used, pe in sorted(port_violations):
+            print(f"[FAIL] Port edge violation! {nm} 透過 edge {used} 出線，但 PORT EDGE 要求為 {pe}")
+            self.fails += 1
 
         # 4. Parse PATH, check routing open, and compute exact HPWL
         total_hpwl = 0
@@ -285,6 +343,8 @@ class Evaluator:
             print(">> 注意！存在 FAIL 違規，此解答將不予計分。")
 
     def plot(self):
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
         fig, ax = plt.subplots(figsize=(10, 8))
         ax.set_xlim(-100, self.max_outline[0] * 1.1)
         ax.set_ylim(-100, self.max_outline[1] * 1.1)

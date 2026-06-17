@@ -240,6 +240,28 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         return compute_final_cost(d) + FAILW * count_edge_fails() + PEN * pen + mag;
     };
 
+    // Report instrumentation: print the per-stage penalty breakdown (channel vs
+    // feedthrough) so the benchmark harness can capture pre/post deltas in one
+    // run.  Re-routes the current layout for a consistent count; off unless
+    // FP_REPORT_STAGES=1.
+    auto stage_report = [&](const char* label) {
+        if (!cfg::REPORT_STAGES) return;
+        route_and_score(); // refresh routing + ft_nets into d.channels / fp.ft_nets
+        int chp = 0;
+        for (auto& ch : d.channels) {
+            if (ch.nets_x > ch.cap_x() + 1e-3) chp++;
+            if (ch.nets_y > ch.cap_y() + 1e-3) chp++;
+        }
+        int ftp = 0;
+        for (int i = 0; i < (int)d.blocks.size(); i++) {
+            if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
+            if (fp.W[i] * fp.H[i] < d.blocks[i].get_target_area(fp.ft_nets[i]) - 1.0) ftp++;
+        }
+        printf("STAGEREPORT %s fails=%d ch=%d ft=%d pen=%d cost=%.1f\n",
+               label, count_edge_fails(), chp, ftp, chp + ftp, compute_final_cost(d));
+        fflush(stdout);
+    };
+
     // ── Route-driven legalize loop ──────────────────────────────────────────
     // Replaces the legacy global-expand ft_iter loop with a hotspot-targeted
     // action cascade (rotate → displace → expand) under strict rollback.  The
@@ -251,6 +273,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
     if (cfg::LEG_ENABLE) {
         printf("[LegalizeLoop] Starting with score %.3f\n", route_and_score());
         finalize_output();
+        stage_report("sa");
         if (is_valid()) {
             LegalizeLoop loop(fp, d,
                               /*finalize=*/ finalize_output,
@@ -270,6 +293,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
             loop.displace_tries = cfg::LEG_TRIES;
             best_score = loop.run();
             have_best  = is_valid();
+            stage_report("legalize");
         }
 
         // ── Final-pass analytical legalizer (multi-attempt, escalating) ──────
@@ -343,6 +367,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                                              cfg::ANA_PASSES));
             for (int k = 0; k < npass; k++)
                 try_analytical(sched[k].step, sched[k].cong, sched[k].iters);
+            stage_report("analytical");
         }
         // ── In-place FT expansion ────────────────────────────────────────────
         // Grow undersized soft blocks into adjacent whitespace (no repack),
@@ -380,6 +405,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                 break;
             }
             printf("[InplaceExpand] Done, score %.3f\n", best_score);
+            stage_report("expand");
         }
     } else {
         // Legacy global-expand convergence (kept for A/B testing via FP_LEG_ENABLE=0).
@@ -443,6 +469,96 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
             }
         return 1e15 + viol;
     }
+
+    // ── Gated penalty-safe compaction (minimize declared area) ──────────────
+    // The contest scores area on the DECLARED outline (out_W*out_H); the packing
+    // and the routing-driven spreading leave inter-block whitespace.  Squeeze the
+    // non-edge blocks toward the origin (left then bottom), retighten the outline
+    // to the new bounding box, re-snap edge blocks to it, and KEEP the result
+    // only if it does not worsen the penalty-aware score.  That score is
+    // lexicographic (FAIL >> penalty >> cost), so any compaction that creates an
+    // overlap / outline FAIL (is_valid) or extra overflow / displaced edge block
+    // (route_and_score) scores higher and is rolled back -- area is never traded
+    // for a penalty.  Position-only: block sizes (fp.W/H, FT areas) are untouched.
+    {
+        const int nbk = (int)d.blocks.size();
+        auto  snap_blocks = d.blocks;
+        auto  snap_outl   = d.outline;
+        auto  snap_chs    = d.channels;
+        auto  snap_paths  = d.paths;
+        double snap_score = best_score;
+
+        std::vector<char> pinned(nbk, 0);
+        for (int i : fp.edge_block_idx)
+            if (i >= 0 && i < nbk) pinned[i] = 1;        // edge blocks snap separately
+
+        for (int it = 0; it < 2 * nbk + 2; it++) {
+            bool moved = false;
+            for (int i = 0; i < nbk; i++) {              // push left
+                if (pinned[i]) continue;
+                auto& b = d.blocks[i];
+                double tx = 0.0;
+                for (int j = 0; j < nbk; j++) {
+                    if (j == i) continue;
+                    auto& o = d.blocks[j];
+                    if (o.ly < b.ly + b.height - 1e-6 && o.ly + o.height > b.ly + 1e-6
+                        && o.lx + o.width <= b.lx + 1e-6)
+                        tx = std::max(tx, o.lx + o.width);
+                }
+                if (tx < b.lx - 1e-6) { b.lx = tx; moved = true; }
+            }
+            for (int i = 0; i < nbk; i++) {              // push bottom
+                if (pinned[i]) continue;
+                auto& b = d.blocks[i];
+                double ty = 0.0;
+                for (int j = 0; j < nbk; j++) {
+                    if (j == i) continue;
+                    auto& o = d.blocks[j];
+                    if (o.lx < b.lx + b.width - 1e-6 && o.lx + o.width > b.lx + 1e-6
+                        && o.ly + o.height <= b.ly + 1e-6)
+                        ty = std::max(ty, o.ly + o.height);
+                }
+                if (ty < b.ly - 1e-6) { b.ly = ty; moved = true; }
+            }
+            if (!moved) break;
+        }
+
+        auto bbox = [&](double& bx, double& by) {
+            bx = 0.0; by = 0.0;
+            for (auto& b : d.blocks) { bx = std::max(bx, b.lx + b.width);
+                                       by = std::max(by, b.ly + b.height); }
+        };
+        double bx, by; bbox(bx, by);
+        // Cheap guard: if the squeeze freed no meaningful area (blocks already
+        // tight, or the outline pinned by boundary edge blocks), skip the costly
+        // re-route + gate entirely and leave the best layout untouched.
+        if (bx * by >= snap_outl.cur_width * snap_outl.cur_height * 0.995) {
+            d.blocks = snap_blocks;
+            return best_score;
+        }
+        double nw = std::min(snap_outl.cur_width,  std::max(bx, 1.0));
+        double nh = std::min(snap_outl.cur_height, std::max(by, 1.0));
+        d.outline.cur_width = nw; d.outline.cur_height = nh;
+        fp.finalize_edge_blocks(nw, nh);               // re-snap edge blocks to tightened outline
+        bbox(bx, by);                                  // edge re-snap may extend the box
+        d.outline.cur_width  = std::min(snap_outl.cur_width,  std::max(bx, 1.0));
+        d.outline.cur_height = std::min(snap_outl.cur_height, std::max(by, 1.0));
+        d.channels = ChannelCalculator::compute(d.blocks,
+                                                d.outline.cur_width, d.outline.cur_height);
+
+        bool keep = false;
+        if (is_valid()) {
+            double sc = route_and_score();
+            if (sc < snap_score - 1e-6) { best_score = sc; keep = true; }
+        }
+        if (!keep) {                                   // revert: no safe area gain
+            d.blocks   = snap_blocks;
+            d.outline  = snap_outl;
+            d.channels = snap_chs;
+            d.paths    = snap_paths;
+        }
+    }
+
     return best_score;
 }
 
@@ -546,8 +662,15 @@ int main(int argc, char* argv[]) {
               << "  Outline max: " << d.outline.max_width << " x " << d.outline.max_height << "\n"
               << "  alpha = " << d.alpha << "\n";
 
-    double time_limit = std::max(30.0, std::min(20 * std::pow((double)1.124, (double)d.blocks.size()), 7100.0)); // Scale time limit with block count
-    if(argv[3] != nullptr) time_limit = std::stod(argv[3]);
+    // Input-adaptive time budget: scale with the real cost drivers -- block
+    // count and connection count -- instead of the old runaway exponential
+    // (20*1.124^n reached ~6800 s at n=50).  Bounded to [30, 240] s so small
+    // designs finish fast and large ones still get a useful budget.  An explicit
+    // CLI arg (argc>3) still overrides, e.g. for the reproducibility harness.
+    double n_blk  = (double)d.blocks.size();
+    double n_conn = (double)d.connections.size();
+    double time_limit = std::min(480.0, std::max(30.0, 15.0 + 4 * n_blk + 0.3 * n_conn));
+    if (argc > 3 && argv[3] != nullptr) time_limit = std::stod(argv[3]);
     
     std::cerr << "[Phase 2] Running search with time limit " << time_limit << "s\n";
 

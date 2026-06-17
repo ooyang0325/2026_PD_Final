@@ -17,9 +17,10 @@ struct Block {
     double area;          
     double width, height; 
     double min_ar, max_ar;
-    std::vector<std::string> locations; 
+    std::vector<std::string> locations;
+    int port_edge = 0;    // routing-port edge: 0=unrestricted, 1=left, 2=top, 3=right, 4=bottom
     FTConversion ft;
-    bool has_fixed_wh;    
+    bool has_fixed_wh;
 
     double lx = 0, ly = 0;
 

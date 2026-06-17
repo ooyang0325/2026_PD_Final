@@ -147,14 +147,51 @@ public:
         int nb = (int)d.blocks.size();
         for (int i : edge_block_idx) {
             auto& b = d.blocks[i];
-            int li = std::min(active_loc[i], (int)b.locations.size() - 1);
-            const std::string& loc = b.locations[li];
+            if (b.locations.empty()) continue;
 
-            double ox = b.lx, oy = b.ly, nx = b.lx, ny = b.ly;
-            if (loc.find('T') != std::string::npos) ny = max_h - b.height;
-            if (loc.find('B') != std::string::npos) ny = 0.0;
-            if (loc.find('L') != std::string::npos) nx = 0.0;
-            if (loc.find('R') != std::string::npos) nx = max_w - b.width;
+            // LOCATION codes use AND semantics (QA A8): 1st letter = flush boundary
+            // (T/B/L/R), 2nd letter = which equal-third along that boundary (QA A10).
+            // A corner block has two codes giving two perpendicular flushes; a single
+            // edge code gives one flush plus a third to overlap along the free axis.
+            // A block may carry several codes on the same boundary (e.g. TL,TM ⇒
+            // top edge spanning the left AND middle thirds).  Accumulate the UNION
+            // of all required thirds per axis so the block is positioned to overlap
+            // every one of them, not just the last.
+            bool fT=false, fB=false, fL=false, fR=false;
+            double xlo=1e18, xhi=-1e18, ylo=1e18, yhi=-1e18;
+            auto third_iv = [](char c, double L, bool xaxis, double& lo, double& hi) {
+                double t3 = L / 3.0;
+                if (xaxis) {                       // width thirds: L / M / R
+                    if      (c=='L') { lo=0;    hi=t3;   }
+                    else if (c=='R') { lo=2*t3; hi=L;    }
+                    else             { lo=t3;   hi=2*t3; }
+                } else {                           // height thirds: T(high y) / M / B(low y)
+                    if      (c=='T') { lo=2*t3; hi=L;    }
+                    else if (c=='B') { lo=0;    hi=t3;   }
+                    else             { lo=t3;   hi=2*t3; }
+                }
+            };
+            for (const auto& loc : b.locations) {
+                if (loc.empty()) continue;
+                char e = (char)std::toupper((unsigned char)loc[0]);
+                char t = (loc.size() >= 2) ? (char)std::toupper((unsigned char)loc[1]) : 'M';
+                double lo, hi;
+                if (e=='T' || e=='B') { (e=='T'?fT:fB)=true; third_iv(t,max_w,true, lo,hi); xlo=std::min(xlo,lo); xhi=std::max(xhi,hi); }
+                else if (e=='L' || e=='R') { (e=='L'?fL:fR)=true; third_iv(t,max_h,false, lo,hi); ylo=std::min(ylo,lo); yhi=std::max(yhi,hi); }
+            }
+
+            double ox=b.lx, oy=b.ly, nx=b.lx, ny=b.ly;
+            if      (fT) ny = max_h - b.height;   // flush top
+            else if (fB) ny = 0.0;                // flush bottom
+            if      (fL) nx = 0.0;                // flush left
+            else if (fR) nx = max_w - b.width;    // flush right
+
+            // Free-axis: center the block on the union of its required thirds so it
+            // overlaps each (overlap, not full containment — QA A19/A20).
+            if (!fL && !fR && xhi > xlo)
+                nx = std::max(0.0, std::min(max_w - b.width,  (xlo+xhi)*0.5 - b.width *0.5));
+            if (!fT && !fB && yhi > ylo)
+                ny = std::max(0.0, std::min(max_h - b.height, (ylo+yhi)*0.5 - b.height*0.5));
 
             b.lx = nx; b.ly = ny;
             bool collide = false;
@@ -169,13 +206,26 @@ public:
         }
     }
 
+    // Pin location for HPWL: the port-edge midpoint when the block declares a port
+    // edge (so placement pulls the actual routing port toward its connections),
+    // else the block center.  Mirrors the router/evaluator edge geometry.
+    std::pair<double,double> pin_xy(int i) const {
+        double x = bst.x[i], y = bst.y[i], w = W[i], h = H[i];
+        switch (d.blocks[i].port_edge) {
+            case 1: return {x,           y + h * 0.5}; // left
+            case 2: return {x + w * 0.5, y + h};       // top
+            case 3: return {x + w,       y + h * 0.5}; // right
+            case 4: return {x + w * 0.5, y};           // bottom
+            default: return {x + w * 0.5, y + h * 0.5};
+        }
+    }
+
     double compute_hpwl() const {
         double total = 0;
         for (auto& conn : d.connections) {
-            int a = conn.from, b = conn.to;
-            double cx_a = bst.x[a] + W[a] * 0.5, cy_a = bst.y[a] + H[a] * 0.5;
-            double cx_b = bst.x[b] + W[b] * 0.5, cy_b = bst.y[b] + H[b] * 0.5;
-            total += conn.nets * (std::abs(cx_b - cx_a) + std::abs(cy_b - cy_a));
+            auto [ax, ay] = pin_xy(conn.from);
+            auto [bx, by] = pin_xy(conn.to);
+            total += conn.nets * (std::abs(bx - ax) + std::abs(by - ay));
         }
         return total;
     }
