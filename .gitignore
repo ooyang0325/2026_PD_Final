@@ -81,3 +81,4 @@ output/
 .pyc
 __pycache__/
 *.txt
+*.zip

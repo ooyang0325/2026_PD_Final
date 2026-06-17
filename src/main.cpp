@@ -669,13 +669,13 @@ int main(int argc, char* argv[]) {
     // CLI arg (argc>3) still overrides, e.g. for the reproducibility harness.
     double n_blk  = (double)d.blocks.size();
     double n_conn = (double)d.connections.size();
-    double time_limit = std::min(480.0, std::max(30.0, 15.0 + 4 * n_blk + 0.3 * n_conn));
+    double time_limit = std::min(1200.0, std::max(60.0, 30.0 + 10 * n_blk +  n_conn));
     if (argc > 3 && argv[3] != nullptr) time_limit = std::stod(argv[3]);
     
     std::cerr << "[Phase 2] Running search with time limit " << time_limit << "s\n";
 
     unsigned hc = std::thread::hardware_concurrency();
-    int workers = (hc > 2) ? (int)hc - 2 : 1;
+    int workers = (int)hc;
     if (workers < 1) workers = 1;
     if (cfg::WORKERS > 0) workers = cfg::WORKERS; // harness / reproducibility override
 
