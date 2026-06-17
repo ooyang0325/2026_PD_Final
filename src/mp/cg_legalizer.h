@@ -38,27 +38,81 @@ public:
         if (n == 0) return true;
 
         // ---- pin state + fixed-axis for EDGE blocks -------------------------
-        // EDGE blocks: the boundary axis named in the active location is FIXED;
-        // the orthogonal axis is free to slide.  We capture the fixed target
-        // coordinate so every sweep can re-snap it after a relaxation step.
+        // EDGE blocks: scan ALL locations and union the flush-edge requirements
+        // (AND-per-edge semantics — see evaluator.check_edge_location).  E.g. a
+        // block with locations {RM, RT, TR} must be flush R (from RM/RT) AND
+        // flush T (from TR), so both x and y are pinned to W-w and H-h
+        // respectively — the TR corner.  Treating only one active_loc here was
+        // a bug: the placer could leave the orthogonal axis free even though
+        // the multi-location spec requires it pinned, letting another block
+        // squat in the corner the EDGE block needed.
         std::vector<bool> pin_x(n, false), pin_y(n, false);
         std::vector<double> fix_x(n, 0.0), fix_y(n, 0.0);
+        // Orthogonal-axis bands: when a block is flush on one axis only and a
+        // location names a third along the other axis (e.g. RM, LM, BM, TM),
+        // its FREE axis must keep the block's extent overlapping the named
+        // band.  Defaults to the full extent for non-EDGE blocks.
+        bx_lo_.assign(n, 0.0); bx_hi_.assign(n, W);
+        by_lo_.assign(n, 0.0); by_hi_.assign(n, H);
         for (int i : fp_.edge_block_idx) {
             const auto& b = d_.blocks[i];
-            int li = std::min(fp_.active_loc[i], (int)b.locations.size() - 1);
-            if (li < 0) continue;
-            const std::string& loc = b.locations[li];
-            if (loc.find('L') != std::string::npos) { pin_x[i] = true; fix_x[i] = 0.0; }
-            if (loc.find('R') != std::string::npos) { pin_x[i] = true; fix_x[i] = W - fp_.W[i]; }
-            if (loc.find('B') != std::string::npos) { pin_y[i] = true; fix_y[i] = 0.0; }
-            if (loc.find('T') != std::string::npos) { pin_y[i] = true; fix_y[i] = H - fp_.H[i]; }
+            bool fL=false, fR=false, fT=false, fB=false;
+            double xlo=1e18, xhi=-1e18, ylo=1e18, yhi=-1e18;
+            auto third_iv = [](char c, double L, bool xaxis, double& lo, double& hi) {
+                double t3 = L / 3.0;
+                if (xaxis) {
+                    if      (c=='L') { lo=0;    hi=t3;   }
+                    else if (c=='R') { lo=2*t3; hi=L;    }
+                    else             { lo=t3;   hi=2*t3; }
+                } else {
+                    if      (c=='T') { lo=2*t3; hi=L;    }
+                    else if (c=='B') { lo=0;    hi=t3;   }
+                    else             { lo=t3;   hi=2*t3; }
+                }
+            };
+            for (const auto& loc : b.locations) {
+                if (loc.empty()) continue;
+                char e = (char)std::toupper((unsigned char)loc[0]);
+                char t = (loc.size() >= 2) ? (char)std::toupper((unsigned char)loc[1]) : 'M';
+                if (e=='L') fL = true;
+                if (e=='R') fR = true;
+                if (e=='T') fT = true;
+                if (e=='B') fB = true;
+                double lo, hi;
+                if (e=='T' || e=='B') {
+                    third_iv(t, W, true, lo, hi);
+                    xlo = std::min(xlo, lo); xhi = std::max(xhi, hi);
+                } else {
+                    third_iv(t, H, false, lo, hi);
+                    ylo = std::min(ylo, lo); yhi = std::max(yhi, hi);
+                }
+            }
+            if (fL) { pin_x[i] = true; fix_x[i] = 0.0; }
+            if (fR) { pin_x[i] = true; fix_x[i] = W - fp_.W[i]; }
+            if (fB) { pin_y[i] = true; fix_y[i] = 0.0; }
+            if (fT) { pin_y[i] = true; fix_y[i] = H - fp_.H[i]; }
+            // Apply band only on the axis still free.  Per evaluator's overlap
+            // rule (QA A19): block extent need only overlap the band, not be
+            // contained — so x ∈ [band_lo - w + eps, band_hi - eps] keeps any
+            // overlap > eps.
+            const double eps = 1e-3;
+            if (!pin_x[i] && xhi > xlo) {
+                bx_lo_[i] = std::max(0.0,        xlo - fp_.W[i] + eps);
+                bx_hi_[i] = std::min(W,          xhi             - eps + fp_.W[i]);
+                if (bx_hi_[i] < bx_lo_[i] + fp_.W[i]) bx_hi_[i] = bx_lo_[i] + fp_.W[i];
+            }
+            if (!pin_y[i] && yhi > ylo) {
+                by_lo_[i] = std::max(0.0,        ylo - fp_.H[i] + eps);
+                by_hi_[i] = std::min(H,          yhi             - eps + fp_.H[i]);
+                if (by_hi_[i] < by_lo_[i] + fp_.H[i]) by_hi_[i] = by_lo_[i] + fp_.H[i];
+            }
         }
 
         // Working coordinates seeded from the global placement, clamped/snapped.
         std::vector<double> x(n), y(n);
         for (int i = 0; i < n; i++) {
-            x[i] = pin_x[i] ? fix_x[i] : clamp(d_.blocks[i].lx, 0.0, W - fp_.W[i]);
-            y[i] = pin_y[i] ? fix_y[i] : clamp(d_.blocks[i].ly, 0.0, H - fp_.H[i]);
+            x[i] = pin_x[i] ? fix_x[i] : clamp(d_.blocks[i].lx, bx_lo_[i], bx_hi_[i] - fp_.W[i]);
+            y[i] = pin_y[i] ? fix_y[i] : clamp(d_.blocks[i].ly, by_lo_[i], by_hi_[i] - fp_.H[i]);
         }
 
         // ---- Attempt 1: constraint-graph cheaper-axis separation -----------
@@ -89,19 +143,25 @@ public:
 private:
     Floorplan& fp_;
     Design&    d_;
+    // Per-block orthogonal-axis bands set up in legalize().  For non-EDGE
+    // blocks (and EDGE blocks with no third constraint on the free axis),
+    // these default to the full extent.  Allow strict-overlap placement: the
+    // block must merely overlap the band, not be contained.
+    std::vector<double> bx_lo_, bx_hi_, by_lo_, by_hi_;
 
     static double clamp(double v, double lo, double hi) {
         if (hi < lo) hi = lo;                 // degenerate: block wider than slack
         return std::max(lo, std::min(hi, v));
     }
 
-    // Re-snap a movable block inside [0,W]x[0,H]; pinned axes return to fixed.
+    // Re-snap a movable block within its band; pinned axes return to fixed.
     void snap_one(int i, std::vector<double>& x, std::vector<double>& y,
                   const std::vector<bool>& pin_x, const std::vector<bool>& pin_y,
                   const std::vector<double>& fix_x, const std::vector<double>& fix_y,
                   double W, double H) {
-        if (pin_x[i]) x[i] = fix_x[i]; else x[i] = clamp(x[i], 0.0, W - fp_.W[i]);
-        if (pin_y[i]) y[i] = fix_y[i]; else y[i] = clamp(y[i], 0.0, H - fp_.H[i]);
+        (void)W; (void)H;
+        if (pin_x[i]) x[i] = fix_x[i]; else x[i] = clamp(x[i], bx_lo_[i], bx_hi_[i] - fp_.W[i]);
+        if (pin_y[i]) y[i] = fix_y[i]; else y[i] = clamp(y[i], by_lo_[i], by_hi_[i] - fp_.H[i]);
     }
 
     // ── Constraint-graph cheaper-axis separation (PeF §IV-B) ─────────────────

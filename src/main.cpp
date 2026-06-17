@@ -12,6 +12,7 @@
 #include "config.h"
 #include <iostream>
 #include <string>
+#include <set>
 #include <chrono>
 #include <future>
 #include <thread>
@@ -219,6 +220,33 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         return fails;
     };
 
+    // Count port-edge violations on the routed paths.  Each unique (block,
+    // edge_used) tuple where the block declares a port_edge and the route's
+    // endpoint edge mismatches counts as one FAIL — matches the evaluator's
+    // dedupe behaviour (script/evaluator.py port_violations set).  Without
+    // this term, parallel workers that produce port_edge violations score
+    // identically to clean ones on the FAIL axis, so a worse-on-port worker
+    // can win on raw area+HPWL.
+    auto count_port_edge_fails = [&]() {
+        std::set<std::pair<int,int>> violations;
+        for (const auto& p : d.paths) {
+            if (p.segments.size() < 2) continue;
+            const auto& src_seg = p.segments.front();
+            const auto& dst_seg = p.segments.back();
+            int src_idx = d.block_idx(src_seg.rect_name);
+            if (src_idx >= 0 && d.blocks[src_idx].port_edge != 0 &&
+                src_seg.edge_out != d.blocks[src_idx].port_edge) {
+                violations.insert({src_idx, src_seg.edge_out});
+            }
+            int dst_idx = d.block_idx(dst_seg.rect_name);
+            if (dst_idx >= 0 && d.blocks[dst_idx].port_edge != 0 &&
+                dst_seg.edge_in != d.blocks[dst_idx].port_edge) {
+                violations.insert({dst_idx, dst_seg.edge_in});
+            }
+        }
+        return (int)violations.size();
+    };
+
     // Penalty-aware score for ranking valid candidates.  The provided evaluator
     // counts each overflowing channel-direction / undersized soft block, so the
     // score counts overflows (heavily) then breaks ties by the proportional
@@ -250,7 +278,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
             double actual   = fp.W[i] * fp.H[i];
             if (actual < required - 1e-9) { pen++; mag += (required - actual); }
         }
-        return compute_final_cost(d) + FAILW * count_edge_fails() + PEN * pen + mag;
+        return compute_final_cost(d) + FAILW * (count_edge_fails() + count_port_edge_fails()) + PEN * pen + mag;
     };
 
     // ── Route-driven legalize loop ──────────────────────────────────────────
@@ -272,6 +300,138 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         // route_and_score), which the routability loop below needs.
         best_score = route_and_score();
         have_best  = is_valid();
+
+        // ── SOFT-reshape rescue (runs BEFORE the RB loop) ─────────────────────
+        // When CGLegalizer leaves overlap (typical at higher util once the
+        // global placer commits to a bad shape for a large SOFT block — see
+        // case1 BLK14 with AR range [0.33, 3] starting near 1.0), sweep the
+        // worst-overlap SOFT block's aspect ratio within [min_ar, max_ar],
+        // re-legalize after each candidate, keep the AR that reduces total
+        // overlap area, and iterate.  Areas are preserved; only the rectangle
+        // shape changes, which is enough to break the gridlock when one block
+        // is geometrically "too square" to fit alongside its neighbours.
+        // Sits before the RB block so a successful rescue's valid layout can
+        // then enter RB and trigger FT-aware soft-block growth.
+        if (!have_best) {
+            const double mpW = d.outline.max_width;
+            const double mpH = d.outline.max_height;
+
+            auto overlap_area_total = [&]() -> double {
+                int nb = (int)d.blocks.size();
+                double sum = 0;
+                for (int i = 0; i < nb; i++)
+                    for (int j = i + 1; j < nb; j++) {
+                        double ox = std::min(d.blocks[i].lx + d.blocks[i].width,
+                                             d.blocks[j].lx + d.blocks[j].width)
+                                  - std::max(d.blocks[i].lx, d.blocks[j].lx);
+                        double oy = std::min(d.blocks[i].ly + d.blocks[i].height,
+                                             d.blocks[j].ly + d.blocks[j].height)
+                                  - std::max(d.blocks[i].ly, d.blocks[j].ly);
+                        if (ox > 0 && oy > 0) sum += ox * oy;
+                    }
+                return sum;
+            };
+            auto block_overlap = [&]() {
+                int nb = (int)d.blocks.size();
+                std::vector<double> ov(nb, 0.0);
+                for (int i = 0; i < nb; i++)
+                    for (int j = i + 1; j < nb; j++) {
+                        double ox = std::min(d.blocks[i].lx + d.blocks[i].width,
+                                             d.blocks[j].lx + d.blocks[j].width)
+                                  - std::max(d.blocks[i].lx, d.blocks[j].lx);
+                        double oy = std::min(d.blocks[i].ly + d.blocks[i].height,
+                                             d.blocks[j].ly + d.blocks[j].height)
+                                  - std::max(d.blocks[i].ly, d.blocks[j].ly);
+                        if (ox > 0 && oy > 0) {
+                            double a = ox * oy;
+                            ov[i] += a; ov[j] += a;
+                        }
+                    }
+                return ov;
+            };
+
+            double cur_ovl = overlap_area_total();
+            std::set<int> tried_locked;
+            const int MAX_ROUNDS = 30;
+            const int AR_SAMPLES = 9;
+            if (cfg::MP_RB_DEBUG)
+                fprintf(stderr, "[Rescue start] ovl_area=%.0f\n", cur_ovl);
+
+            for (int round = 0; round < MAX_ROUNDS && cur_ovl > 1e-3; round++) {
+                auto ov = block_overlap();
+                int pick = -1;
+                double pick_a = 0;
+                for (int i = 0; i < (int)d.blocks.size(); i++) {
+                    if (d.blocks[i].type != BlockType::SOFT) continue;
+                    if (tried_locked.count(i)) continue;
+                    if (ov[i] > pick_a) { pick_a = ov[i]; pick = i; }
+                }
+                if (pick < 0) break;
+
+                const auto& b0 = d.blocks[pick];
+                double area = fp.W[pick] * fp.H[pick];
+                double mn = b0.min_ar, mx = b0.max_ar;
+                if (!(mx >= mn && mx > 0) || mx - mn < 1e-6) {
+                    tried_locked.insert(pick);
+                    continue;
+                }
+
+                double sW = fp.W[pick], sH = fp.H[pick];
+                double sbw = d.blocks[pick].width, sbh = d.blocks[pick].height;
+                std::vector<double> cx, cy;
+                cx.reserve(d.blocks.size()); cy.reserve(d.blocks.size());
+                for (auto& b : d.blocks) { cx.push_back(b.lx); cy.push_back(b.ly); }
+
+                double best_w = sW, best_h = sH, best_ovl = cur_ovl;
+                for (int k = 0; k < AR_SAMPLES; k++) {
+                    double t = AR_SAMPLES > 1 ? (double)k / (AR_SAMPLES - 1) : 0.5;
+                    double ar = mn * std::pow(mx / mn, t);
+                    double w_new = std::sqrt(area * ar);
+                    w_new = std::round(w_new * 100.0) / 100.0;
+                    if (w_new < 0.01) continue;
+                    double h_new = std::ceil((area / w_new) * 100.0) / 100.0;
+                    while (w_new * h_new < area - 1e-6) h_new += 0.01;
+                    if (w_new > mpW + 1e-3 || h_new > mpH + 1e-3) continue;
+
+                    fp.W[pick] = w_new; fp.H[pick] = h_new;
+                    d.blocks[pick].width = w_new; d.blocks[pick].height = h_new;
+                    mp::CGLegalizer lg(fp, d);
+                    lg.legalize(mpW, mpH);
+                    fp.finalize_edge_blocks(mpW, mpH);
+                    double ov_now = overlap_area_total();
+                    if (ov_now < best_ovl - 1e-3) {
+                        best_ovl = ov_now;
+                        best_w = w_new; best_h = h_new;
+                    }
+                }
+
+                if (best_ovl < cur_ovl - 1e-3) {
+                    fp.W[pick] = best_w; fp.H[pick] = best_h;
+                    d.blocks[pick].width = best_w; d.blocks[pick].height = best_h;
+                    mp::CGLegalizer lg(fp, d);
+                    lg.legalize(mpW, mpH);
+                    fp.finalize_edge_blocks(mpW, mpH);
+                    cur_ovl = best_ovl;
+                    if (cfg::MP_RB_DEBUG)
+                        fprintf(stderr, "[Rescue r%d] BLK#%d -> %.2fx%.2f, ovl=%.0f\n",
+                                round, pick, best_w, best_h, cur_ovl);
+                } else {
+                    fp.W[pick] = sW; fp.H[pick] = sH;
+                    d.blocks[pick].width = sbw; d.blocks[pick].height = sbh;
+                    for (int k = 0; k < (int)d.blocks.size(); k++) {
+                        d.blocks[k].lx = cx[k]; d.blocks[k].ly = cy[k];
+                    }
+                    tried_locked.insert(pick);
+                }
+            }
+
+            d.channels = ChannelCalculator::compute(d.blocks, mpW, mpH);
+            best_score = route_and_score();
+            have_best  = is_valid();
+            if (cfg::MP_RB_DEBUG)
+                fprintf(stderr, "[Rescue done] valid=%d ovl=%.0f score=%.3e\n",
+                        (int)have_best, cur_ovl, best_score);
+        }
 
         // ── Phase 5: routability outer loop (greedy FT-aware soft sizing) ────
         // Engaged ONLY when this seed yielded a valid, penalised layout.  For an
@@ -317,7 +477,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                         d.blocks[i].get_target_area(fp.ft_nets[i]) - 1e-3) pen++;
                 }
                 penalties = pen;
-                fails = count_edge_fails() + (is_valid() ? 0 : 1);
+                fails = count_edge_fails() + count_port_edge_fails() + (is_valid() ? 0 : 1);
                 cost  = compute_final_cost(d);
             };
 
@@ -536,7 +696,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                         d.blocks[i].get_target_area(fp.ft_nets[i]) - 1e-3) p++;
                 }
                 pen = p;
-                fails = count_edge_fails() + (is_valid() ? 0 : 1);
+                fails = count_edge_fails() + count_port_edge_fails() + (is_valid() ? 0 : 1);
                 cost = compute_final_cost(d);
             };
 
@@ -757,6 +917,25 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         while (w_out * fp.H[i] < d.blocks[i].area) fp.H[i] += 0.01;
         d.blocks[i].width  = fp.W[i];
         d.blocks[i].height = fp.H[i];
+    }
+
+    // After all dimension nudges, snap output positions to 2dp and ensure each
+    // block fits in the (possibly shrunk) outline.  Ceil'd h/w combined with
+    // a flush-edge position can otherwise push ly+h or lx+w 0.01 µm past the
+    // boundary — a hard FAIL ("outline violation") despite a logically clean
+    // layout (e.g. case1 BLK01 area 352968: 594.11² < area → h↑ to 594.12 →
+    // ly + 594.12 = 2200.01 > H = 2200).
+    {
+        const double Wc = d.outline.cur_width;
+        const double Hc = d.outline.cur_height;
+        for (auto& b : d.blocks) {
+            b.lx = std::round(b.lx * 100.0) / 100.0;
+            b.ly = std::round(b.ly * 100.0) / 100.0;
+            if (b.lx + b.width > Wc + 1e-9)
+                b.lx = std::max(0.0, std::round((Wc - b.width) * 100.0) / 100.0);
+            if (b.ly + b.height > Hc + 1e-9)
+                b.ly = std::max(0.0, std::round((Hc - b.height) * 100.0) / 100.0);
+        }
     }
 
     d_in = d;
