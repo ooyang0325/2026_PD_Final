@@ -491,6 +491,141 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                 }
             }
         }
+
+        // ── Outline compaction (post-RB) ─────────────────────────────────────
+        // The MP path holds (cur_width, cur_height) == (max_width, max_height)
+        // through the routability loop to keep the maximum channel budget.
+        // Once the layout is valid and clean, shrink the outline as far as
+        // CGLegalizer can re-pin all EDGE blocks without overlap / OOB and the
+        // routed layout still passes the lexicographic test (FAIL count, then
+        // penalty count, then cost).  Channels narrow with the outline, so a
+        // shrink that gains area but spills routing is rolled back.
+        // source: plan §Compaction — coordinate-descent shrink with CG re-leg.
+        if (have_best && best_score < FAILW) {
+            struct CSnap {
+                std::vector<Block> blocks; std::vector<Channel> channels;
+                std::vector<RoutePath> paths; Outline outline;
+                std::vector<double> W, H; std::vector<int> ft_nets, active_loc;
+            };
+            auto csnap = [&]() {
+                CSnap s; s.blocks=d.blocks; s.channels=d.channels;
+                s.paths=d.paths; s.outline=d.outline; s.W=fp.W; s.H=fp.H;
+                s.ft_nets=fp.ft_nets; s.active_loc=fp.active_loc; return s;
+            };
+            auto crest = [&](const CSnap& s) {
+                d.blocks=s.blocks; d.channels=s.channels; d.paths=s.paths;
+                d.outline=s.outline; fp.W=s.W; fp.H=s.H;
+                fp.ft_nets=s.ft_nets; fp.active_loc=s.active_loc;
+            };
+            // Measure (fails, penalties, cost) by routing once at d.outline.cur_*.
+            // Mirrors the RB-loop measure_state but reads the current outline,
+            // so it sees the shrunk channels.
+            auto cmeasure = [&](int& fails, int& pen, double& cost) {
+                GlobalRouter gr;
+                gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
+                gr.route_all(d, 20);
+                collect_ft();
+                int p = 0;
+                for (auto& ch : d.channels) {
+                    if (ch.nets_x > ch.cap_x() + 1e-3) p++;
+                    if (ch.nets_y > ch.cap_y() + 1e-3) p++;
+                }
+                for (int i = 0; i < (int)d.blocks.size(); i++) {
+                    if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
+                    if (fp.W[i] * fp.H[i] <
+                        d.blocks[i].get_target_area(fp.ft_nets[i]) - 1e-3) p++;
+                }
+                pen = p;
+                fails = count_edge_fails() + (is_valid() ? 0 : 1);
+                cost = compute_final_cost(d);
+            };
+
+            // Lower bound on the shrunk outline: every single block must still
+            // fit; an L+R edge-block pair must fit side-by-side (analogous for
+            // T+B).  Tighter geometric bounds are left to the legalize probe.
+            double lbW = 0.0, lbH = 0.0;
+            for (auto& b : d.blocks) {
+                lbW = std::max(lbW, b.width);
+                lbH = std::max(lbH, b.height);
+            }
+            double maxL=0, maxR=0, maxT=0, maxB=0;
+            bool hasL=false, hasR=false, hasT=false, hasB=false;
+            for (int i : fp.edge_block_idx) {
+                int li = std::min(fp.active_loc[i], (int)d.blocks[i].locations.size()-1);
+                if (li < 0) continue;
+                const auto& loc = d.blocks[i].locations[li];
+                if (loc.find('L')!=std::string::npos) { hasL=true; maxL=std::max(maxL, d.blocks[i].width); }
+                if (loc.find('R')!=std::string::npos) { hasR=true; maxR=std::max(maxR, d.blocks[i].width); }
+                if (loc.find('T')!=std::string::npos) { hasT=true; maxT=std::max(maxT, d.blocks[i].height); }
+                if (loc.find('B')!=std::string::npos) { hasB=true; maxB=std::max(maxB, d.blocks[i].height); }
+            }
+            if (hasL && hasR) lbW = std::max(lbW, maxL + maxR);
+            if (hasT && hasB) lbH = std::max(lbH, maxT + maxB);
+
+            // Baseline = the just-committed RB result, re-measured under its
+            // own outline (which is currently max_*).
+            int  base_f = 0, base_p = 0;
+            double base_c = 0.0;
+            cmeasure(base_f, base_p, base_c);
+            if (cfg::MP_RB_DEBUG)
+                fprintf(stderr, "[Compact base] %.2fx%.2f f=%d p=%d c=%.3e (lb=%.2fx%.2f)\n",
+                        d.outline.cur_width, d.outline.cur_height,
+                        base_f, base_p, base_c, lbW, lbH);
+
+            // Try a candidate outline; revert on lex non-improvement.  Returns
+            // true iff committed.
+            auto try_outline = [&](double tryW, double tryH) -> bool {
+                if (tryW < lbW - 1e-6 || tryH < lbH - 1e-6) return false;
+                if (tryW > d.outline.max_width  + 1e-6) return false;
+                if (tryH > d.outline.max_height + 1e-6) return false;
+                CSnap before = csnap();
+                d.outline.cur_width  = tryW;
+                d.outline.cur_height = tryH;
+                mp::CGLegalizer lg(fp, d);
+                lg.legalize(tryW, tryH);
+                fp.finalize_edge_blocks(tryW, tryH);
+                d.channels = ChannelCalculator::compute(d.blocks, tryW, tryH);
+                int f, p; double c;
+                cmeasure(f, p, c);
+                bool better =
+                    (f <  base_f) ||
+                    (f == base_f && p <  base_p) ||
+                    (f == base_f && p == base_p && c < base_c - 1.0);
+                if (better) {
+                    base_f = f; base_p = p; base_c = c;
+                    return true;
+                }
+                crest(before);
+                return false;
+            };
+
+            // Coordinate descent with geometric steps {15%, 8%, 4%, 2%, 1%}.
+            // For each step size: keep shrinking that axis while it improves,
+            // alternating axes per outer round.  Largest steps first capture
+            // most of the gain cheaply; finer steps polish.
+            const double steps[] = {0.15, 0.08, 0.04, 0.02, 0.01};
+            for (double s : steps) {
+                bool again = true;
+                while (again) {
+                    again = false;
+                    double dW = d.outline.cur_width  * s;
+                    double dH = d.outline.cur_height * s;
+                    if (d.outline.cur_width - dW >= lbW &&
+                        try_outline(d.outline.cur_width - dW, d.outline.cur_height))
+                        again = true;
+                    if (d.outline.cur_height - dH >= lbH &&
+                        try_outline(d.outline.cur_width, d.outline.cur_height - dH))
+                        again = true;
+                }
+            }
+
+            best_score = base_c + FAILW * base_f + PEN * base_p;
+            have_best  = is_valid();
+            if (cfg::MP_RB_DEBUG)
+                fprintf(stderr, "[Compact done] %.2fx%.2f f=%d p=%d c=%.3e\n",
+                        d.outline.cur_width, d.outline.cur_height,
+                        base_f, base_p, base_c);
+        }
     } else if (cfg::LEG_ENABLE) {
         printf("[LegalizeLoop] Starting with score %.3f\n", route_and_score());
         finalize_output();
@@ -729,13 +864,13 @@ int main(int argc, char* argv[]) {
               << "  Outline max: " << d.outline.max_width << " x " << d.outline.max_height << "\n"
               << "  alpha = " << d.alpha << "\n";
 
-    double time_limit = std::max(30.0, std::min(20 * std::pow((double)1.124, (double)d.blocks.size()), 7100.0)); // Scale time limit with block count
+    double time_limit = std::min(1200.0, std::max(60.0, 30.0 + 10 * d.blocks.size() +  d.connections.size())); // Scale time limit with block count
     if(argv[3] != nullptr) time_limit = std::stod(argv[3]);
     
     std::cerr << "[Phase 2] Running search with time limit " << time_limit << "s\n";
 
     unsigned hc = std::thread::hardware_concurrency();
-    int workers = (hc > 2) ? (int)hc - 2 : 1;
+    int workers = hc;
     if (workers < 1) workers = 1;
 
     std::vector<std::future<std::pair<double, Design>>> futures;
