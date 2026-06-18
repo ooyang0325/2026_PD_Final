@@ -463,18 +463,44 @@ private:
     }
 
     void accum_nets(const RoutePath& path, int nets, Design& d) const {
-        for (auto& seg : path.segments) {
-            if (seg.rect_name.size() >= 2 && seg.rect_name.substr(0,2) == "CH") {
-                for (auto& ch : d.channels) {
-                    if (ch.name == seg.rect_name) {
-                        // 判定跨越方向
-                        bool has_x = (seg.edge_in == 1 || seg.edge_in == 3 || seg.edge_out == 1 || seg.edge_out == 3);
-                        bool has_y = (seg.edge_in == 2 || seg.edge_in == 4 || seg.edge_out == 2 || seg.edge_out == 4);
-                        if (has_x) const_cast<Channel&>(ch).nets_x += nets;
-                        if (has_y) const_cast<Channel&>(ch).nets_y += nets;
-                        break;
-                    }
+        auto rect_of = [&](const std::string& nm) -> std::array<double,4> {
+            for (auto& b : d.blocks)   if (b.name == nm) return {b.lx, b.ly, b.width,  b.height};
+            for (auto& c : d.channels) if (c.name == nm) return {c.lx, c.ly, c.width,  c.height};
+            return {0,0,0,0};
+        };
+        auto overlap_mid = [&](const std::array<double,4>& A, const std::array<double,4>& B) {
+            double ox0 = std::max(A[0], B[0]);
+            double ox1 = std::min(A[0]+A[2], B[0]+B[2]);
+            double oy0 = std::max(A[1], B[1]);
+            double oy1 = std::min(A[1]+A[3], B[1]+B[3]);
+            return std::pair<double,double>{(ox0+ox1)*0.5, (oy0+oy1)*0.5};
+        };
+        const auto& segs = path.segments;
+        for (int i = 0; i < (int)segs.size(); i++) {
+            const auto& seg = segs[i];
+            if (seg.rect_name.size() < 2 || seg.rect_name.substr(0,2) != "CH") continue;
+            for (auto& ch : d.channels) {
+                if (ch.name != seg.rect_name) continue;
+                bool has_x = (seg.edge_in == 1 || seg.edge_in == 3 || seg.edge_out == 1 || seg.edge_out == 3);
+                bool has_y = (seg.edge_in == 2 || seg.edge_in == 4 || seg.edge_out == 2 || seg.edge_out == 4);
+                // Z-shape inside channel: parallel-edge entry/exit at a different
+                // transverse coord uses BOTH axes' capacity (spec Fig 6).
+                if (i > 0 && i + 1 < (int)segs.size()) {
+                    auto ch_rect   = rect_of(seg.rect_name);
+                    auto prev_rect = rect_of(segs[i-1].rect_name);
+                    auto next_rect = rect_of(segs[i+1].rect_name);
+                    auto entry = overlap_mid(ch_rect, prev_rect);
+                    auto exit  = overlap_mid(ch_rect, next_rect);
+                    if ((seg.edge_in == 1 || seg.edge_in == 3) &&
+                        (seg.edge_out == 1 || seg.edge_out == 3) &&
+                        std::abs(entry.second - exit.second) > 1e-3) has_y = true;
+                    if ((seg.edge_in == 2 || seg.edge_in == 4) &&
+                        (seg.edge_out == 2 || seg.edge_out == 4) &&
+                        std::abs(entry.first - exit.first) > 1e-3) has_x = true;
                 }
+                if (has_x) const_cast<Channel&>(ch).nets_x += nets;
+                if (has_y) const_cast<Channel&>(ch).nets_y += nets;
+                break;
             }
         }
     }

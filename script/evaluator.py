@@ -78,6 +78,10 @@ class Evaluator:
                                 val = val.strip()
                                 if val and float(val) > 0:
                                     target = self.conn_headers[i]
+                                    if name == target:
+                                        # Self-loop entries (matrix diagonal) cannot be routed;
+                                        # they are not real connections between distinct blocks.
+                                        continue
                                     # 建立無向連接
                                     pair = tuple(sorted([name, target]))
                                     self.conn_matrix[pair] = max(self.conn_matrix.get(pair, 0), float(val))
@@ -272,12 +276,27 @@ class Evaluator:
                 gp = self.get_guiding_point(r1, e1, r2, e2)
                 guiding_points.append(gp)
                 
-                # If the intermediate node is a channel, determine and accumulate directional flow
+                # If the intermediate node is a channel, determine and accumulate directional flow.
+                # Per spec Fig 6, the route inside a channel is Straight / L / Z:
+                #   - L (perpendicular edges, e.g. in=1 out=2)      → uses both axes
+                #   - Straight (parallel edges, same transverse y or x) → one axis
+                #   - Z (parallel edges, DIFFERENT transverse coord) → uses both axes
+                # The original code only checked edge labels and missed Z-shape,
+                # which lets sub-micron slivers carry vertical flow with no real
+                # capacity (e.g. case0 CH10: w=0.10 µm, 3300 nets routed Z-shape).
                 if i > 0 and r1.startswith("CH"):
                     in_dir = r_info[i]["in"]
                     out_dir = r_info[i]["out"]
                     has_x = in_dir in ['1', '3'] or out_dir in ['1', '3']
                     has_y = in_dir in ['2', '4'] or out_dir in ['2', '4']
+                    gp_in = guiding_points[i-1]   # entry point into this channel
+                    gp_out = gp                    # exit point from this channel
+                    # Parallel horizontal edges with different y → Z-shape needs vertical cap
+                    if in_dir in ['1', '3'] and out_dir in ['1', '3'] and abs(gp_in[1] - gp_out[1]) > 1e-3:
+                        has_y = True
+                    # Parallel vertical edges with different x → Z-shape needs horizontal cap
+                    if in_dir in ['2', '4'] and out_dir in ['2', '4'] and abs(gp_in[0] - gp_out[0]) > 1e-3:
+                        has_x = True
                     if has_x: self.channels[r1]["nets_x"] += nets
                     if has_y: self.channels[r1]["nets_y"] += nets
                     
@@ -368,13 +387,24 @@ class Evaluator:
 
         for p in self.paths:
             r_info = p["route_info"]
-            gps =[]
+            gps = []
             for i in range(len(r_info)-1):
                 gp = self.get_guiding_point(r_info[i]["name"], r_info[i]["out"], r_info[i+1]["name"], r_info[i+1]["in"])
                 if gp != (0,0): gps.append(gp)
-            if gps:
-                xs, ys = zip(*gps)
-                ax.plot(xs, ys, marker='o', markersize=4, linestyle='-', linewidth=1.5, alpha=0.8)
+            if not gps: continue
+            # Per spec (Figure 6): routes are rectilinear — Straight / L-shape /
+            # Z-shape, never diagonal.  Between consecutive guiding points draw
+            # an L-shape (horizontal then vertical); the HPWL (Manhattan) is
+            # identical to the spec's Straight/L/Z conventions.  Drawing as a
+            # diagonal makes thin slivers look like vertical streaks even when
+            # the route is mostly a short horizontal hop.
+            xs = [gps[0][0]]; ys = [gps[0][1]]
+            for i in range(1, len(gps)):
+                px, py = gps[i-1]; cx, cy = gps[i]
+                if cx != px:
+                    xs.append(cx); ys.append(py)
+                xs.append(cx); ys.append(cy)
+            ax.plot(xs, ys, marker='o', markersize=4, linestyle='-', linewidth=1.5, alpha=0.8)
 
         plt.title("ICCAD 2026 Early Floorplanning Visualization")
         plt.xlabel("X (um)")
