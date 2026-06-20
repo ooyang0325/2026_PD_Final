@@ -1,4 +1,5 @@
 #pragma once
+#include "config.h"
 #include "types.h"
 #include "channel.h"
 #include <vector>
@@ -24,11 +25,6 @@
 // This directed model prevents "boundary relay" (chaining multiple adjacency edges
 // without interior traversal), which would create invalid PATH entries.
 
-struct FaceId {
-    int rect_idx;
-    int edge;   // 1=L, 2=T, 3=R, 4=B
-};
-
 struct RectInfo {
     std::string name;
     double lx, ly, w, h;
@@ -36,19 +32,17 @@ struct RectInfo {
     bool allow_ft;
 };
 
-static bool intervals_overlap(double a0, double a1, double b0, double b1) {
+namespace {
+bool intervals_overlap(double a0, double a1, double b0, double b1) {
     return a0 < b1 - 1e-6 && b0 < a1 - 1e-6;
 }
+} // namespace
 
 class GlobalRouter {
 public:
     std::vector<RectInfo> rects;
     std::vector<double> ch_penalty;
     int n_blocks = 0;
-
-    // Cost multiplier for routing through a SOFT block (feedthrough).  > 1 so the
-    // router prefers channels; feedthrough is used only when unavoidable.
-    static constexpr double FT_TRAVERSE_PENALTY = 3.0;
 
     std::unordered_map<std::string, int> name_to_idx;
 
@@ -110,7 +104,7 @@ public:
                         // multiplier so the router prefers routing AROUND through
                         // channels, and only feeds through as a last resort when
                         // no channel path exists.
-                        cost *= FT_TRAVERSE_PENALTY;
+                        cost *= cfg::FT_TRAVERSE_PENALTY;
                     }
                     adj[face_enter(i, ein)].push_back({face_exit(i, eout), cost});
                 }
@@ -398,8 +392,8 @@ private:
                         (seg.edge_out == 2 || seg.edge_out == 4) &&
                         std::abs(entry.first - exit.first) > 1e-3) has_x = true;
                 }
-                if (has_x) const_cast<Channel&>(ch).nets_x += nets;
-                if (has_y) const_cast<Channel&>(ch).nets_y += nets;
+                if (has_x) ch.nets_x += nets;
+                if (has_y) ch.nets_y += nets;
                 break;
             }
         }

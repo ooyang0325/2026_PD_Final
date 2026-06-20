@@ -53,7 +53,6 @@ public:
     int    grid_w     = 24;     // density-grid resolution
     int    grid_h     = 24;
     double cong_w     = 100.0;  // congestion-source weight in density grid
-    double repel_w    = 3.0;    // unused, kept so existing knob wiring doesn't break
 
     AnalyticalLegalizer(Floorplan& fp_, Design& d_) : fp(fp_), d(d_) {}
 

@@ -82,27 +82,3 @@ private:
         return free;
     }
 };
-
-// Adjacency info between blocks/channels for routing graph
-struct RectId {
-    bool is_channel;
-    int idx; // index in blocks or channels vector
-};
-
-// Edge number convention: 1=left, 2=top, 3=right, 4=bottom
-// Center of edge N of rectangle (lx,ly,w,h):
-inline std::pair<double,double> edge_center(double lx, double ly, double w, double h, int edge) {
-    switch (edge) {
-        case 1: return {lx,       ly + h/2};
-        case 2: return {lx + w/2, ly + h};
-        case 3: return {lx + w,   ly + h/2};
-        case 4: return {lx + w/2, ly};
-    }
-    return {0,0};
-}
-
-// Opposite edge
-inline int opp_edge(int e) {
-    switch(e) { case 1:return 3; case 2:return 4; case 3:return 1; case 4:return 2; }
-    return 0;
-}

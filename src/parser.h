@@ -9,15 +9,17 @@
 #include <algorithm>
 #include <cmath>
 
-static std::string trim(const std::string& s) {
+namespace {
+
+std::string trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r\n");
     if (a == std::string::npos) return "";
     size_t b = s.find_last_not_of(" \t\r\n");
     return s.substr(a, b - a + 1);
 }
 
-// 解析百分比 "20%" -> 0.2 或 "0.2" -> 0.2
-static double parse_pct(const std::string& s) {
+// Parse percentage ("20%" → 0.2) or bare decimal ("0.2" → 0.2).
+double parse_pct(const std::string& s) {
     std::string t = trim(s);
     if (t.empty()) return 0.0;
     bool is_pct = (!t.empty() && t.back() == '%');
@@ -28,6 +30,8 @@ static double parse_pct(const std::string& s) {
     return v;
 }
 
+} // namespace
+
 class Parser {
 public:
     static Design load_csv(const std::string& path) {
@@ -35,18 +39,18 @@ public:
         std::ifstream f(path, std::ios::binary);
         if (!f) { std::cerr << "Cannot open " << path << "\n"; return d; }
 
-        // 讀取整個檔案到字串
+        // Read entire file into a string.
         std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        
-        // 過濾 UTF-8 BOM
-        if (content.size() >= 3 && 
+
+        // Strip UTF-8 BOM if present.
+        if (content.size() >= 3 &&
             (unsigned char)content[0] == 0xEF &&
             (unsigned char)content[1] == 0xBB &&
             (unsigned char)content[2] == 0xBF) {
             content = content.substr(3);
         }
 
-        // 穩健的 CSV 解析 (支援引號內的換行符號)
+        // Robust CSV parse: supports quoted fields (including embedded newlines).
         std::vector<std::vector<std::string>> rows;
         std::vector<std::string> current_row;
         std::string field;
@@ -56,7 +60,7 @@ public:
             char c = content[i];
             if (c == '"') {
                 if (in_quote && i + 1 < content.size() && content[i+1] == '"') {
-                    field += '"'; // 處理逸出引號 ""
+                    field += '"'; // escaped quote ""
                     i++;
                 } else {
                     in_quote = !in_quote;
@@ -66,7 +70,7 @@ public:
                 field.clear();
             } else if ((c == '\n' || c == '\r') && !in_quote) {
                 if (c == '\r' && i + 1 < content.size() && content[i+1] == '\n') {
-                    i++; // 處理 CRLF
+                    i++; // consume CRLF as one line ending
                 }
                 current_row.push_back(field);
                 rows.push_back(current_row);
@@ -81,7 +85,7 @@ public:
             rows.push_back(current_row);
         }
 
-        enum Section { NONE, BLOCK, OUTLINE, ALPHA_SEC, CONN_HEADER, CONN_DATA } sec = NONE;
+        enum Section { NONE, BLOCK, OUTLINE, CONN_HEADER, CONN_DATA } sec = NONE;
         std::vector<std::string> block_names;
         bool got_conn_col_header = false;
         // The 2026-06-17 testcase format inserts a "PORT EDGE" column between
@@ -94,10 +98,10 @@ public:
             if (row.empty()) continue;
             std::string c0 = trim(row[0]);
 
-            // Section 判斷
+            // Section detection.
             if (c0 == "BLOCK") {
                 sec = BLOCK;
-                for (auto& cell : row) {            // detect optional PORT EDGE column
+                for (auto& cell : row) {
                     std::string t = trim(cell);
                     std::transform(t.begin(), t.end(), t.begin(), ::toupper);
                     if (t.find("PORT EDGE") != std::string::npos) { has_port_edge = true; break; }
@@ -106,12 +110,12 @@ public:
             }
             if (c0 == "OUTLINE") { sec = OUTLINE; continue; }
 
-            // 判斷是否為 alpha 列 (相容各種奇怪的 UTF-8 α 字元)
+            // Detect alpha row (compatible with various UTF-8 representations of α).
             {
                 std::string lc0 = c0;
                 std::transform(lc0.begin(), lc0.end(), lc0.begin(), ::tolower);
                 bool is_alpha = (lc0 == "a" || lc0 == "alpha" ||
-                                 lc0.find("α") != std::string::npos || 
+                                 lc0.find("α") != std::string::npos ||
                                  lc0.find('\xce') != std::string::npos);
                 if (is_alpha && row.size() > 1) {
                     std::string val = trim(row[1]);
@@ -131,12 +135,12 @@ public:
                 continue;
             }
 
-            // 略過全空或只有分隔符號的行
+            // Skip blank rows.
             bool all_blank = true;
             for (auto& f2 : row) if (!trim(f2).empty()) { all_blank = false; break; }
             if (all_blank) continue;
 
-            // ─── BLOCK 解析 ───────────────────────────────────────────────
+            // ─── BLOCK section ────────────────────────────────────────────────
             if (sec == BLOCK) {
                 if (c0.empty() || c0 == "BLOCK" || c0 == "FT CONVERSION" ||
                     c0.substr(0,2) == "<=" || c0.substr(0,1) == ">" || c0 == "AREA") continue;
@@ -155,7 +159,7 @@ public:
                 if (row.size() > 3 && !trim(row[3]).empty())
                     try { b.height = std::stod(trim(row[3])); } catch (...) {}
 
-                // 解析長寬比 (支援 "0.5,2" 格式)
+                // Aspect ratio: supports "0.5,2" range or a single fixed value.
                 b.min_ar = b.max_ar = 1.0;
                 if (row.size() > 4 && !trim(row[4]).empty()) {
                     std::string ar_str = trim(row[4]);
@@ -172,7 +176,7 @@ public:
                     }
                 }
 
-                // 判斷類型
+                // Block type from the LOCATION column keyword.
                 b.type = BlockType::SOFT;
                 b.has_fixed_wh = false;
                 if (row.size() > 5 && !trim(row[5]).empty()) {
@@ -182,7 +186,7 @@ public:
                     else                                             { b.type = BlockType::SOFT;       b.has_fixed_wh = false; }
                 }
 
-                // 解析 LOCATION 限制 (支援 "BR,RB" 等多重組合)
+                // LOCATION constraint (supports comma-separated codes like "BR,RB").
                 if (row.size() > 6 && !trim(row[6]).empty()) {
                     std::string loc_str = trim(row[6]);
                     loc_str.erase(std::remove(loc_str.begin(), loc_str.end(), '"'), loc_str.end());
@@ -196,7 +200,7 @@ public:
                     }
                 }
 
-                // PORT EDGE (col 7, new format only): 1=left,2=top,3=right,4=bottom; 0/empty=unrestricted
+                // PORT EDGE (col 7, new format only): 1=left,2=top,3=right,4=bottom; 0/empty=unrestricted.
                 b.port_edge = 0;
                 if (has_port_edge && row.size() > 7 && !trim(row[7]).empty()) {
                     try {
@@ -205,7 +209,7 @@ public:
                     } catch (...) {}
                 }
 
-                // FT 轉換率 (cols shift right by 1 when PORT EDGE is present)
+                // FT conversion rates (columns shift right by 1 when PORT EDGE is present).
                 int ftc = has_port_edge ? 8 : 7;
                 double defaults[4] = {0.2, 0.4, 0.8, 1.0};
                 for (int k = 0; k < 4; k++) {
@@ -214,7 +218,7 @@ public:
                         b.ft.rate[k] = parse_pct(row[ftc+k]);
                 }
 
-                // 若只有 Area 則推導初始 W, H
+                // Derive missing dimension: if only area given, assume square.
                 if (b.width == 0.0 && b.height == 0.0 && b.area > 0.0) {
                     b.width = std::sqrt(b.area);
                     b.height = std::sqrt(b.area);
@@ -227,7 +231,7 @@ public:
                 continue;
             }
 
-            // ─── OUTLINE 解析 ─────────────────────────────────────────────
+            // ─── OUTLINE section ──────────────────────────────────────────────
             if (sec == OUTLINE) {
                 if (c0 == "MAX") {
                     if (row.size() > 1 && !trim(row[1]).empty())
@@ -240,7 +244,7 @@ public:
                 continue;
             }
 
-            // ─── CONNECTION MATRIX 解析 ────────────────────────────────────
+            // ─── CONNECTION MATRIX section ────────────────────────────────────
             if (sec == CONN_HEADER) {
                 if (!got_conn_col_header) {
                     bool has_blocks = false;

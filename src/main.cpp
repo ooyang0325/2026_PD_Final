@@ -363,6 +363,44 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
     double best_score = 1e18;
     bool have_best = false;
 
+    // Full mutable snapshot for lexicographic rollback (used by both the
+    // routability loop and the outline compaction pass).
+    struct Snap {
+        std::vector<Block> blocks; std::vector<Channel> channels;
+        std::vector<RoutePath> paths; Outline outline;
+        std::vector<double> W, H; std::vector<int> ft_nets, active_loc;
+    };
+    auto take_snap = [&]() {
+        Snap s; s.blocks = d.blocks; s.channels = d.channels;
+        s.paths = d.paths; s.outline = d.outline; s.W = fp.W; s.H = fp.H;
+        s.ft_nets = fp.ft_nets; s.active_loc = fp.active_loc; return s;
+    };
+    auto restore_snap = [&](const Snap& s) {
+        d.blocks = s.blocks; d.channels = s.channels; d.paths = s.paths;
+        d.outline = s.outline; fp.W = s.W; fp.H = s.H;
+        fp.ft_nets = s.ft_nets; fp.active_loc = s.active_loc;
+    };
+    // Lexicographic measure: (fails, penalties, cost). Routes once.
+    auto measure_state = [&](int& fails, int& penalties, double& cost) {
+        GlobalRouter gr;
+        gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
+        gr.route_all(d, 20);
+        collect_ft();
+        int pen = 0;
+        for (auto& ch : d.channels) {
+            if (ch.nets_x > ch.cap_x() + 1e-3) pen++;
+            if (ch.nets_y > ch.cap_y() + 1e-3) pen++;
+        }
+        for (int i = 0; i < (int)d.blocks.size(); i++) {
+            if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
+            if (fp.W[i] * fp.H[i] <
+                d.blocks[i].get_target_area(fp.ft_nets[i]) - 1e-3) pen++;
+        }
+        penalties = pen;
+        fails = count_edge_fails() + count_port_edge_fails() + (is_valid() ? 0 : 1);
+        cost  = compute_final_cost(d);
+    };
+
     if (use_mp) {
         // MP path: skip tree-based finalize/legalize.  Route unconditionally
         // so d.paths is populated and the output .cfg always has a PATH
@@ -535,27 +573,6 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
             const double mpW = d.outline.max_width;
             const double mpH = d.outline.max_height;
 
-            // Lexicographic measure: (fails, penalties, cost).  Routes once.
-            auto measure_state = [&](int& fails, int& penalties, double& cost) {
-                GlobalRouter gr;
-                gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
-                gr.route_all(d, 20);
-                collect_ft();
-                int pen = 0;
-                for (auto& ch : d.channels) {
-                    if (ch.nets_x > ch.cap_x() + 1e-3) pen++;
-                    if (ch.nets_y > ch.cap_y() + 1e-3) pen++;
-                }
-                for (int i = 0; i < (int)d.blocks.size(); i++) {
-                    if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
-                    // Match the evaluator's 1e-3 tolerance (evaluator.py:269).
-                    if (fp.W[i] * fp.H[i] <
-                        d.blocks[i].get_target_area(fp.ft_nets[i]) - 1e-3) pen++;
-                }
-                penalties = pen;
-                fails = count_edge_fails() + count_port_edge_fails() + (is_valid() ? 0 : 1);
-                cost  = compute_final_cost(d);
-            };
 
             // Resize ONE soft block to its measured FT target, using ar_hint
             // (clamped to [min_ar,max_ar]) when > 0, else preserving current AR.
@@ -624,22 +641,6 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                 return count_edge_fails() + (is_valid() ? 0 : 1);
             };
 
-            // Full mutable snapshot for lexicographic rollback.
-            struct Snap {
-                std::vector<Block> blocks; std::vector<Channel> channels;
-                std::vector<RoutePath> paths; Outline outline;
-                std::vector<double> W, H; std::vector<int> ft_nets, active_loc;
-            };
-            auto take_snap = [&]() {
-                Snap s; s.blocks = d.blocks; s.channels = d.channels;
-                s.paths = d.paths; s.outline = d.outline; s.W = fp.W; s.H = fp.H;
-                s.ft_nets = fp.ft_nets; s.active_loc = fp.active_loc; return s;
-            };
-            auto restore_snap = [&](const Snap& s) {
-                d.blocks = s.blocks; d.channels = s.channels; d.paths = s.paths;
-                d.outline = s.outline; fp.W = s.W; fp.H = s.H;
-                fp.ft_nets = s.ft_nets; fp.active_loc = s.active_loc;
-            };
 
             // Baseline = the already-routed valid iter0.
             int best_fails = 0, best_pen = 0;
@@ -905,43 +906,6 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         // shrink that gains area but spills routing is rolled back.
         // source: plan §Compaction — coordinate-descent shrink with CG re-leg.
         if (have_best && best_score < FAILW) {
-            struct CSnap {
-                std::vector<Block> blocks; std::vector<Channel> channels;
-                std::vector<RoutePath> paths; Outline outline;
-                std::vector<double> W, H; std::vector<int> ft_nets, active_loc;
-            };
-            auto csnap = [&]() {
-                CSnap s; s.blocks=d.blocks; s.channels=d.channels;
-                s.paths=d.paths; s.outline=d.outline; s.W=fp.W; s.H=fp.H;
-                s.ft_nets=fp.ft_nets; s.active_loc=fp.active_loc; return s;
-            };
-            auto crest = [&](const CSnap& s) {
-                d.blocks=s.blocks; d.channels=s.channels; d.paths=s.paths;
-                d.outline=s.outline; fp.W=s.W; fp.H=s.H;
-                fp.ft_nets=s.ft_nets; fp.active_loc=s.active_loc;
-            };
-            // Measure (fails, penalties, cost) by routing once at d.outline.cur_*.
-            // Mirrors the RB-loop measure_state but reads the current outline,
-            // so it sees the shrunk channels.
-            auto cmeasure = [&](int& fails, int& pen, double& cost) {
-                GlobalRouter gr;
-                gr.init(d.blocks, d.channels, d.outline.max_width, d.outline.max_height);
-                gr.route_all(d, 20);
-                collect_ft();
-                int p = 0;
-                for (auto& ch : d.channels) {
-                    if (ch.nets_x > ch.cap_x() + 1e-3) p++;
-                    if (ch.nets_y > ch.cap_y() + 1e-3) p++;
-                }
-                for (int i = 0; i < (int)d.blocks.size(); i++) {
-                    if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0) continue;
-                    if (fp.W[i] * fp.H[i] <
-                        d.blocks[i].get_target_area(fp.ft_nets[i]) - 1e-3) p++;
-                }
-                pen = p;
-                fails = count_edge_fails() + count_port_edge_fails() + (is_valid() ? 0 : 1);
-                cost = compute_final_cost(d);
-            };
 
             // Lower bound on the shrunk outline: every single block must still
             // fit; an L+R edge-block pair must fit side-by-side (analogous for
@@ -969,7 +933,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
             // own outline (which is currently max_*).
             int  base_f = 0, base_p = 0;
             double base_c = 0.0;
-            cmeasure(base_f, base_p, base_c);
+            measure_state(base_f, base_p, base_c);
             if (cfg::MP_RB_DEBUG)
                 fprintf(stderr, "[Compact base] %.2fx%.2f f=%d p=%d c=%.3e (lb=%.2fx%.2f)\n",
                         d.outline.cur_width, d.outline.cur_height,
@@ -981,7 +945,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                 if (tryW < lbW - 1e-6 || tryH < lbH - 1e-6) return false;
                 if (tryW > d.outline.max_width  + 1e-6) return false;
                 if (tryH > d.outline.max_height + 1e-6) return false;
-                CSnap before = csnap();
+                Snap before = take_snap();
                 d.outline.cur_width  = tryW;
                 d.outline.cur_height = tryH;
                 mp::CGLegalizer lg(fp, d);
@@ -990,7 +954,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                 fp.finalize_edge_blocks(tryW, tryH);
                 d.channels = ChannelCalculator::compute(d.blocks, tryW, tryH);
                 int f, p; double c;
-                cmeasure(f, p, c);
+                measure_state(f, p, c);
                 bool better =
                     (f <  base_f) ||
                     (f == base_f && p <  base_p) ||
@@ -999,7 +963,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                     base_f = f; base_p = p; base_c = c;
                     return true;
                 }
-                crest(before);
+                restore_snap(before);
                 return false;
             };
 
@@ -1031,7 +995,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                         base_f, base_p, base_c);
         }
     } else if (cfg::LEG_ENABLE) {
-        printf("[LegalizeLoop] Starting with score %.3f\n", route_and_score());
+        std::fprintf(stderr, "[LegalizeLoop] Starting with score %.3f\n", route_and_score());
         finalize_output();
         if (is_valid()) {
             LegalizeLoop loop(fp, d,
@@ -1051,7 +1015,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         // Breaks the B*-tree by design (user-approved): operates directly on
         // (lx, ly) coordinates.  Strict rollback if it doesn't improve.
         if (have_best && cfg::ANA_ENABLE) {
-            printf("[Analytical] Starting with score %.3f\n", best_score);
+            std::fprintf(stderr, "[Analytical] Starting with score %.3f\n", best_score);
             // Snapshot the full pre-analytical state.
             auto snap_bst    = fp.bst.save();
             auto snap_W      = fp.W;
@@ -1069,7 +1033,6 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
             AnalyticalLegalizer ana(fp, d);
             ana.iterations = cfg::ANA_ITERS;
             ana.step_frac  = cfg::ANA_STEP;
-            ana.repel_w    = cfg::ANA_REPEL;
             bool moved = ana.run();
 
             if (moved) {
@@ -1293,7 +1256,7 @@ int main(int argc, char* argv[]) {
     // on the algorithm faster.  Floor 60 s, cap 1440 s (24 min).  CLI overrides.
     double time_limit = std::min(1440.0, std::max(60.0,
         20.0 * (double)d.blocks.size() + 4.0 * (double)d.connections.size()));
-    if(argv[3] != nullptr) time_limit = std::stod(argv[3]);
+    if (argc >= 4) time_limit = std::stod(argv[3]);
     
     std::cerr << "[Phase 2] Running search with time limit " << time_limit << "s\n";
 
