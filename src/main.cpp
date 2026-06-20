@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 #include <cmath>
+#include <optional>
 
 // Derive a representative point for HPWL based on edge adjacency.
 static std::pair<double, double> get_guiding_point(
@@ -124,6 +125,78 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
 
     const bool use_mp = (cfg::ENGINE == "mp");
 
+    // ── Per-pair SEP boost (route-driven outer feedback) ─────────────────────
+    // boost_x[i][j] multiplies the gap REQUIRED between blocks i,j on the x-axis.
+    // Bumped whenever a channel between i and j overflows along its narrow axis;
+    // the next legalize pass widens that channel enough to carry the demand.
+    // Symmetric: boost[i][j] = boost[j][i].  Lifted to function scope so the
+    // first-pass MP placement and the Phase 5 RB loop (which lives outside the
+    // initial else-block) share the same state.
+    const int N_BL = (int)d.blocks.size();
+    std::vector<std::vector<double>> sep_boost_x(N_BL, std::vector<double>(N_BL, 1.0));
+    std::vector<std::vector<double>> sep_boost_y(N_BL, std::vector<double>(N_BL, 1.0));
+
+    auto apply_boost = [&](mp::CGLegalizer& lg) {
+        lg.set_boost(sep_boost_x, sep_boost_y);
+    };
+
+    // For each overflowing channel: bump per-pair boost between the blocks
+    // bracketing the channel along the axis that needs to widen.  Vertical flow
+    // (nets_y > cap_y) → too narrow → bump x-boost between LEFT and RIGHT
+    // neighbors.  Horizontal flow → bump y-boost between ABOVE and BELOW.
+    auto bump_boost_from_overflow = [&]() -> int {
+        // Aggressive geometric boost: STEP=2.0 (doubling per round), CAP=500
+        // (~9 effective rounds before saturating).  High CAP matters because
+        // connection demand can require 100+ µm of gap (5000 nets / 25 nets-per-µm
+        // = 200 µm channel width to satisfy one CH cap).
+        const double STEP = 2.0;
+        const double CAP  = 500.0;
+        int bumped = 0;
+        for (auto& ch : d.channels) {
+            double cap_x = ch.cap_x(), cap_y = ch.cap_y();
+            double over_x = std::max(0.0, ch.nets_x - cap_x);
+            double over_y = std::max(0.0, ch.nets_y - cap_y);
+            if (over_y > 0) {
+                std::vector<int> left, right;
+                for (int i = 0; i < N_BL; i++) {
+                    auto& b = d.blocks[i];
+                    double y0 = std::max(b.ly,           ch.ly);
+                    double y1 = std::min(b.ly+b.height,  ch.ly+ch.height);
+                    if (y1 - y0 <= 1e-6) continue;
+                    if (std::abs(b.lx + b.width - ch.lx)            < 1e-2) left.push_back(i);
+                    if (std::abs(b.lx           - (ch.lx+ch.width)) < 1e-2) right.push_back(i);
+                }
+                for (int li : left) for (int ri : right) {
+                    sep_boost_x[li][ri] = std::min(CAP, sep_boost_x[li][ri] * STEP);
+                    sep_boost_x[ri][li] = sep_boost_x[li][ri];
+                    bumped++;
+                }
+            }
+            if (over_x > 0) {
+                std::vector<int> above, below;
+                for (int i = 0; i < N_BL; i++) {
+                    auto& b = d.blocks[i];
+                    double x0 = std::max(b.lx,           ch.lx);
+                    double x1 = std::min(b.lx+b.width,   ch.lx+ch.width);
+                    if (x1 - x0 <= 1e-6) continue;
+                    if (std::abs(b.ly + b.height - ch.ly)             < 1e-2) below.push_back(i);
+                    if (std::abs(b.ly           - (ch.ly+ch.height))  < 1e-2) above.push_back(i);
+                }
+                for (int ai : above) for (int bi : below) {
+                    sep_boost_y[ai][bi] = std::min(CAP, sep_boost_y[ai][bi] * STEP);
+                    sep_boost_y[bi][ai] = sep_boost_y[ai][bi];
+                    bumped++;
+                }
+            }
+        }
+        return bumped;
+    };
+
+    // Lift MPOptimizer out of the else-block so the Phase 5 RB loop can call
+    // mp_opt->set_wl_boost / mp_opt->restart_from_positions for plan-C route
+    // feedback.  Empty for the SA path.
+    std::optional<MPOptimizer> mp_opt;
+
     if (!use_mp) {
         // ── SA phase 1 ──────────────────────────────────────────────────────
         SAOptimizer sa(fp, seed1);
@@ -143,8 +216,8 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         // then a coordinate-only legalization bridge removes all block overlaps
         // within the FULL max outline (whitespace = channel capacity, so we do
         // NOT shrink below the max outline — see plan Architecture §routability).
-        MPOptimizer mp(fp, d, seed1);
-        mp.run();
+        mp_opt.emplace(fp, d, seed1);
+        mp_opt->run();
 
         // Use the full max outline as the placement region.
         const double mpW = d.outline.max_width;
@@ -155,6 +228,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
         // Remove block-block overlaps on coordinates; EDGE blocks stay pinned to
         // their active boundary location.  Return value is logged via the score.
         mp::CGLegalizer leg(fp, d);
+        apply_boost(leg);
         leg.legalize(mpW, mpH);
 
         // Overlap-safe EDGE boundary snap on coordinates (pattern:
@@ -396,6 +470,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                     fp.W[pick] = w_new; fp.H[pick] = h_new;
                     d.blocks[pick].width = w_new; d.blocks[pick].height = h_new;
                     mp::CGLegalizer lg(fp, d);
+                    apply_boost(lg);
                     lg.legalize(mpW, mpH);
                     fp.finalize_edge_blocks(mpW, mpH);
                     double ov_now = overlap_area_total();
@@ -409,6 +484,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                     fp.W[pick] = best_w; fp.H[pick] = best_h;
                     d.blocks[pick].width = best_w; d.blocks[pick].height = best_h;
                     mp::CGLegalizer lg(fp, d);
+                    apply_boost(lg);
                     lg.legalize(mpW, mpH);
                     fp.finalize_edge_blocks(mpW, mpH);
                     cur_ovl = best_ovl;
@@ -481,22 +557,23 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                 cost  = compute_final_cost(d);
             };
 
-            // Resize ONE soft block to its measured FT target, preserving the
-            // current AR clamped to [min_ar,max_ar].  Updates fp.W/H AND d.blocks
-            // dims (the evaluator reads d.blocks).  False if already big enough.
+            // Resize ONE soft block to its measured FT target, using ar_hint
+            // (clamped to [min_ar,max_ar]) when > 0, else preserving current AR.
+            // Updates fp.W/H AND d.blocks dims.  False if already big enough.
             // source: types.h get_target_area; AR clamp mirrors apply_ft_areas.
-            auto resize_one_to_ft = [&](int i) -> bool {
+            auto resize_one_to_ft = [&](int i, double ar_hint = -1.0) -> bool {
                 if (d.blocks[i].type != BlockType::SOFT || fp.ft_nets[i] <= 0)
                     return false;
                 const double required = d.blocks[i].get_target_area(fp.ft_nets[i]);
                 if (required <= fp.W[i] * fp.H[i] + 1e-3) return false;
-                double ar = (fp.H[i] > 0) ? fp.W[i] / fp.H[i] : 1.0;
+                double ar = (ar_hint > 0.0)
+                          ? ar_hint
+                          : ((fp.H[i] > 0) ? fp.W[i] / fp.H[i] : 1.0);
                 double mn = d.blocks[i].min_ar, mx = d.blocks[i].max_ar;
                 if (mx >= mn && mx > 0.0) ar = std::max(mn, std::min(mx, ar));
                 // 1e-4 overshoot ensures the sqrt→ceil chain almost always lands
                 // above 'required' in one shot; the while loop is the backstop for
-                // the rare case where ceil-rounding still undershoots (e.g. BLK02
-                // deficit = 0.91 µm² with 1e-6 overshoot).
+                // the rare case where ceil-rounding still undershoots.
                 double target = required * (1.0 + 1e-4);
                 double raw_w = std::sqrt(target * ar);
                 fp.W[i] = std::ceil(raw_w * 100.0) / 100.0;
@@ -507,10 +584,40 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                 return true;
             };
 
+            // FT-demand-weighted AR candidates: heavily-routed blocks should
+            // expose more perimeter (= more adjacent channel area where FT
+            // actually flows).  Order: current → max_ar → min_ar → geometric
+            // mean — first that lets the block grow without breaking legality
+            // wins.  For ft_nets[i] above the high-demand threshold the
+            // perimeter-maximizing ARs come FIRST.
+            auto ar_candidates = [&](int i) -> std::vector<double> {
+                std::vector<double> cands;
+                double cur = (fp.H[i] > 0) ? fp.W[i] / fp.H[i] : 1.0;
+                double mn = d.blocks[i].min_ar, mx = d.blocks[i].max_ar;
+                if (!(mx >= mn && mx > 0.0)) { cands.push_back(cur); return cands; }
+                cur = std::max(mn, std::min(mx, cur));
+                double gm = std::sqrt(mn * mx);
+                bool high_ft = fp.ft_nets[i] >= 3000;   // ft tier 1 boundary
+                if (high_ft) {
+                    // Perimeter-max first: extremes of AR range.
+                    cands.push_back(mx);
+                    cands.push_back(mn);
+                    cands.push_back(cur);
+                    cands.push_back(gm);
+                } else {
+                    cands.push_back(cur);
+                    cands.push_back(mx);
+                    cands.push_back(mn);
+                    cands.push_back(gm);
+                }
+                return cands;
+            };
+
             // Cheap route-free feasibility: legalize current dims, snap edges,
             // report fail count.  Gates each single-block growth in µs.
             auto legalize_and_fails = [&]() -> int {
                 mp::CGLegalizer lg(fp, d);
+                apply_boost(lg);
                 lg.legalize(mpW, mpH);
                 fp.finalize_edge_blocks(mpW, mpH);
                 d.channels = ChannelCalculator::compute(d.blocks, mpW, mpH);
@@ -548,6 +655,18 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                 if (best_fails == 0 && best_pen == 0) break;  // already clean
                 restore_snap(best_snap);                      // work from best
 
+                // Re-legalize under the current SEP boost (may have grown since
+                // best_snap was taken).  Lets the route-feedback bump actually
+                // move blocks even on passes that grow no soft blocks.  Cheap —
+                // no routing — and gated by the legalize feasibility tracker.
+                {
+                    mp::CGLegalizer lg(fp, d);
+                    apply_boost(lg);
+                    lg.legalize(mpW, mpH);
+                    fp.finalize_edge_blocks(mpW, mpH);
+                    d.channels = ChannelCalculator::compute(d.blocks, mpW, mpH);
+                }
+
                 // Candidate undersized soft blocks, largest area-deficit first.
                 std::vector<std::pair<double,int>> cands;
                 for (int i = 0; i < (int)d.blocks.size(); i++) {
@@ -568,11 +687,14 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                     cx.reserve(d.blocks.size()); cy.reserve(d.blocks.size());
                     for (auto& b : d.blocks) { cx.push_back(b.lx); cy.push_back(b.ly); }
 
-                    if (!resize_one_to_ft(i)) continue;
-                    if (legalize_and_fails() <= best_fails) {
-                        grown++;
-                    } else {
-                        // Revert this block's growth and the legalized coords.
+                    bool accepted = false;
+                    for (double ar : ar_candidates(i)) {
+                        if (!resize_one_to_ft(i, ar)) { accepted = true; break; }
+                        if (legalize_and_fails() <= best_fails) {
+                            accepted = true; grown++;
+                            break;
+                        }
+                        // Revert this AR and try the next candidate.
                         fp.W[i] = sW; fp.H[i] = sH;
                         d.blocks[i].width = sbw; d.blocks[i].height = sbh;
                         for (int k = 0; k < (int)d.blocks.size(); k++) {
@@ -580,11 +702,21 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                         }
                         d.channels = ChannelCalculator::compute(d.blocks, mpW, mpH);
                     }
+                    (void)accepted;
                 }
 
                 // Re-route ONCE and re-measure the true penalty count.
                 int it_fails = 0, it_pen = 0; double it_cost = 0.0;
                 measure_state(it_fails, it_pen, it_cost);
+
+                // ── Route-feedback: bump per-pair SEP for overflowing channels.
+                // The next legalize pass widens these channels by pushing the
+                // bracketing block-pairs apart on the deficient axis.  Even when
+                // this RB pass is rolled back (didn't improve), the boost stays
+                // in effect because it lives outside best_snap — so subsequent
+                // passes try a wider geometry without re-discovering the issue.
+                int bumped = bump_boost_from_overflow();
+
                 bool better =
                     (it_fails <  best_fails) ||
                     (it_fails == best_fails && it_pen <  best_pen) ||
@@ -597,10 +729,10 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                     restore_snap(best_snap);             // discard this pass
                 }
                 if (cfg::MP_RB_DEBUG)
-                    fprintf(stderr, "[RB pass%d] grown=%d -> f=%d p=%d c=%.3e "
-                            "(best f=%d p=%d)\n", pass, grown, it_fails, it_pen,
+                    fprintf(stderr, "[RB pass%d] grown=%d bumped=%d -> f=%d p=%d c=%.3e "
+                            "(best f=%d p=%d)\n", pass, grown, bumped, it_fails, it_pen,
                             it_cost, best_fails, best_pen);
-                if (grown == 0) break;                   // fixpoint
+                if (grown == 0 && bumped == 0) break;     // fixpoint
             }
 
             // Commit the best snapshot and re-route it so d.paths/d.channels
@@ -608,6 +740,117 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
             restore_snap(best_snap);
             best_score = route_and_score();
             have_best  = is_valid();
+
+            // ── Q1(b) plan-C: route-feedback Nesterov restart ───────────────
+            // If the legalize-only RB loop still leaves overflowing channels,
+            // the placer chose endpoints too far apart for the channel grid
+            // to carry their demand.  Identify those endpoints from the
+            // currently routed paths, bump per-pair WL weights via the WL
+            // boost matrix, re-run Nesterov from the current legalized
+            // positions, re-legalize, and accept only if it improves the
+            // lexicographic (fails, pen, cost) score.  At most one restart
+            // per worker; the bump is rolled back on regression.
+            if (have_best && mp_opt && best_score < FAILW && best_pen > 0) {
+                Snap pre_snap = take_snap();
+                int    pre_fails = best_fails;
+                int    pre_pen   = best_pen;
+                double pre_cost  = best_cost;
+
+                // Accumulate boost per (src, dst) pair across all overflowing
+                // channels.  Each pair's bump scales with the channel's
+                // proportional overflow and the path's net count.  Cap each
+                // pair's total bump so a single hub doesn't dominate.
+                std::map<std::pair<int,int>, double> pair_bump;
+                int N_BL_LOC = (int)d.blocks.size();
+                for (const auto& ch : d.channels) {
+                    double cap_x = ch.cap_x(), cap_y = ch.cap_y();
+                    double over_x = std::max(0.0, ch.nets_x - cap_x);
+                    double over_y = std::max(0.0, ch.nets_y - cap_y);
+                    if (over_x <= 0.0 && over_y <= 0.0) continue;
+                    double over_ratio = std::max(
+                        over_x / std::max(1.0, cap_x),
+                        over_y / std::max(1.0, cap_y));
+                    for (const auto& p : d.paths) {
+                        if (p.segments.size() < 2) continue;
+                        bool through = false;
+                        for (const auto& seg : p.segments) {
+                            if (seg.rect_name == ch.name) { through = true; break; }
+                        }
+                        if (!through) continue;
+                        int src = d.block_idx(p.segments.front().rect_name);
+                        int dst = d.block_idx(p.segments.back().rect_name);
+                        if (src < 0 || dst < 0 || src == dst) continue;
+                        if (src >= N_BL_LOC || dst >= N_BL_LOC) continue;
+                        int a = std::min(src, dst);
+                        int b = std::max(src, dst);
+                        pair_bump[{a,b}] += over_ratio * (double)p.nets / 1000.0;
+                    }
+                }
+
+                if (!pair_bump.empty()) {
+                    // Small perturbation: 0.3 cap → weight up to 1.3× the
+                    // base.  A larger cap (3.0) was tested and rejected — it
+                    // pushed the Nesterov restart to rebalance too aggressively,
+                    // producing layouts with more penalties or new fails than
+                    // the starting state.  A gentle nudge is enough to escape
+                    // local minima caused by a single congested channel.
+                    const double PER_PAIR_CAP = 0.3;
+                    for (auto& kv : pair_bump) {
+                        double v = std::min(PER_PAIR_CAP, kv.second);
+                        mp_opt->set_wl_boost(kv.first.first, kv.first.second, v);
+                    }
+                    // Restart Nesterov from current legalized positions.
+                    mp_opt->restart_from_positions();
+                    // Outline stays at max for the routability budget.
+                    d.outline.cur_width  = mpW;
+                    d.outline.cur_height = mpH;
+                    // Re-legalize under the existing SEP boost matrix.
+                    {
+                        mp::CGLegalizer lg(fp, d);
+                        apply_boost(lg);
+                        lg.legalize(mpW, mpH);
+                        fp.finalize_edge_blocks(mpW, mpH);
+                        d.channels = ChannelCalculator::compute(d.blocks, mpW, mpH);
+                    }
+                    int post_fails = 0, post_pen = 0;
+                    double post_cost = 0.0;
+                    measure_state(post_fails, post_pen, post_cost);
+
+                    bool better =
+                        (post_fails <  pre_fails) ||
+                        (post_fails == pre_fails && post_pen <  pre_pen) ||
+                        (post_fails == pre_fails && post_pen == pre_pen &&
+                         post_cost < pre_cost - 1.0);
+                    if (better) {
+                        best_fails = post_fails;
+                        best_pen   = post_pen;
+                        best_cost  = post_cost;
+                        best_snap  = take_snap();
+                        best_score = route_and_score();
+                        have_best  = is_valid();
+                        if (cfg::MP_RB_DEBUG)
+                            fprintf(stderr,
+                                "[RB plan-C] accepted: f=%d p=%d c=%.3e "
+                                "(was f=%d p=%d c=%.3e)\n",
+                                post_fails, post_pen, post_cost,
+                                pre_fails, pre_pen, pre_cost);
+                    } else {
+                        // Roll back: restore snapshot and wash the boost so
+                        // the FT-clearing pass below sees the original WL.
+                        restore_snap(pre_snap);
+                        mp_opt->clear_wl_boost();
+                        best_fails = pre_fails;
+                        best_pen   = pre_pen;
+                        best_cost  = pre_cost;
+                        if (cfg::MP_RB_DEBUG)
+                            fprintf(stderr,
+                                "[RB plan-C] rejected: f=%d p=%d c=%.3e vs "
+                                "best f=%d p=%d c=%.3e — rolled back\n",
+                                post_fails, post_pen, post_cost,
+                                pre_fails, pre_pen, pre_cost);
+                    }
+                }
+            }
 
             // ── Final FT-clearing safety pass ───────────────────────────────
             // The committed re-route above may assign feedthrough to a soft block
@@ -742,6 +985,7 @@ static double run_once(Design& d_in, double sa1_time, double sa2_time, unsigned 
                 d.outline.cur_width  = tryW;
                 d.outline.cur_height = tryH;
                 mp::CGLegalizer lg(fp, d);
+                apply_boost(lg);
                 lg.legalize(tryW, tryH);
                 fp.finalize_edge_blocks(tryW, tryH);
                 d.channels = ChannelCalculator::compute(d.blocks, tryW, tryH);
@@ -1043,7 +1287,12 @@ int main(int argc, char* argv[]) {
               << "  Outline max: " << d.outline.max_width << " x " << d.outline.max_height << "\n"
               << "  alpha = " << d.alpha << "\n";
 
-    double time_limit = std::min(1200.0, std::max(60.0, 30.0 + 10 * d.blocks.size() +  d.connections.size())); // Scale time limit with block count
+    // Time-limit: 1/5 of the prior generous formula.  The halo-floor change
+    // (CGLegalizer base SEP = HALO/2) gives the legalizer enough protected
+    // gap up front, so fewer RB feedback passes are needed.  Lets us iterate
+    // on the algorithm faster.  Floor 60 s, cap 1440 s (24 min).  CLI overrides.
+    double time_limit = std::min(1440.0, std::max(60.0,
+        20.0 * (double)d.blocks.size() + 4.0 * (double)d.connections.size()));
     if(argv[3] != nullptr) time_limit = std::stod(argv[3]);
     
     std::cerr << "[Phase 2] Running search with time limit " << time_limit << "s\n";

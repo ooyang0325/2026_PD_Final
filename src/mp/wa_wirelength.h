@@ -70,6 +70,22 @@ public:
         }
     }
 
+    // Q1(b) plan-C accessors — route-feedback connection-weight boost.
+    // set_boost(a, b, v) accumulates v into the symmetric pair (a, b).
+    // After the route-feedback step, each subsequent compute() uses
+    // w' = w · (1 + wl_boost_[a][b]).  v ≥ 0; the loop caps growth.
+    void set_boost(int a, int b, double v) {
+        ensure_boost();
+        if (a < 0 || b < 0 || a >= nb_ || b >= nb_) return;
+        wl_boost_[a][b] += v;
+        wl_boost_[b][a] += v;
+    }
+    void clear_boost() {
+        if ((int)wl_boost_.size() == nb_) {
+            for (auto& row : wl_boost_) std::fill(row.begin(), row.end(), 0.0);
+        }
+    }
+
     WAResult compute(const std::vector<double>& x,
                      const std::vector<double>& y,
                      double gamma)
@@ -83,11 +99,20 @@ public:
         res.grad_y.assign(nb_, 0.0);
         res.cost = 0.0;
 
+        // Q1(b) plan-C: route-feedback per-connection weight boost set by the
+        // outer RB loop.  Default boost is 0; the per-net weight becomes
+        // w * (1 + wl_boost_[a][b]) when the matrix is allocated.  Plan-A's
+        // global super-linear amplification was tested and regressed case4
+        // (it over-concentrated multi-hub structures); the boost is now
+        // targeted at the specific pairs whose routes overflow channels.
         for (const auto& c : d_.connections) {
             if (c.from < 0 || c.to < 0) continue;
             if (c.from >= nb_ || c.to >= nb_) continue;
-            const double w = (double)c.nets;
+            double w = (double)c.nets;
             if (w == 0.0) continue;
+            if ((int)wl_boost_.size() == nb_) {
+                w *= (1.0 + wl_boost_[c.from][c.to]);
+            }
 
             const int a = c.from;
             const int b = c.to;
@@ -196,8 +221,15 @@ private:
         g1 = d1_min - d1_max;
     }
 
+    void ensure_boost() {
+        if ((int)wl_boost_.size() != nb_) {
+            wl_boost_.assign(nb_, std::vector<double>(nb_, 0.0));
+        }
+    }
+
     const Design& d_;
     int nb_;
+    std::vector<std::vector<double>> wl_boost_;  // n×n, default empty
 };
 
 // γ schedule per ePlace Eq. 38 / nesterovPlace.cpp:1172-1186.  `base` is

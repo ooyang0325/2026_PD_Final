@@ -36,7 +36,12 @@ inline double MP_INIT_LAMBDA     = 8e-5; // λ0 scale (ePlace Eq. 35)
 inline double MP_PHI_MIN         = 0.95; // phiCoef clamp lower
 inline double MP_PHI_MAX         = 1.05; // phiCoef clamp upper
 inline double MP_HALO_SCALE      = 1.0;  // demand-driven halo multiplier
-inline int    MP_RB_ITERS        = 4;    // routability outer-loop iterations
+inline int    MP_RB_ITERS        = 30;   // routability outer-loop iterations
+                                          // (drives route → SEP-bump → re-legalize
+                                          //  feedback; 30 lets the boost matrix
+                                          //  saturate for outliers AND newly-
+                                          //  discovered overflows after earlier
+                                          //  ones clear)
 inline double MP_TDENSITY        = 0.0;  // ρt target (0 = auto from utilization)
 inline int    MP_RB_DEBUG        = 0;    // 1 = trace routability outer loop to stderr
 

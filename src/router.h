@@ -99,7 +99,12 @@ public:
                         int ci = i - n_blocks;
                         if (ci >= 0 && ci < (int)ch_penalty.size())
                             cost *= ch_penalty[ci];
-                    } else {
+                        // Sub-µm channel: cap_x = h×25 (or cap_y = w×25) below
+                        // 25 nets total — physically infeasible.  Add a large
+                        // absolute penalty so Dijkstra avoids these slivers
+                        // whenever any alternative path exists.  Belt-and-
+                        // suspenders to the CGLegalizer SEP=1.0 minimum gap.
+                        if (R.w < 1.0 || R.h < 1.0) cost += 1e6;
                         // Feeding through a SOFT block is expensive: it forces the
                         // module to grow (FT area conversion).  Charge a heavy
                         // multiplier so the router prefers routing AROUND through
@@ -149,9 +154,23 @@ public:
 
             bool overflow = false;
             for (int i = 0; i < (int)d.channels.size(); i++) {
-                if (d.channels[i].overflowed()) {
+                auto& ch = d.channels[i];
+                double cap_x = ch.cap_x();
+                double cap_y = ch.cap_y();
+                double over_x = std::max(0.0, ch.nets_x - cap_x) / std::max(1.0, cap_x);
+                double over_y = std::max(0.0, ch.nets_y - cap_y) / std::max(1.0, cap_y);
+                double over   = std::max(over_x, over_y);
+                if (over > 0.0) {
                     overflow = true;
-                    ch_penalty[i] = std::min(ch_penalty[i] * 2.0, 1e6);
+                    // Penalty-driven cost: scales with overflow ratio + ratio².
+                    // 1× overflow → ×3 bump.  10× overflow → ×~110 bump.  This
+                    // makes the next Dijkstra round avoid the worst-overflow
+                    // channels first, while only mildly bumping channels that
+                    // are barely over capacity.  Cap at 1e9 to keep Dijkstra
+                    // numerically well-behaved (overall edge cost stays below
+                    // 1e12 for the longest path).
+                    double bump = 1.0 + 2.0 * over + over * over;
+                    ch_penalty[i] = std::min(ch_penalty[i] * bump, 1e9);
                 }
             }
             if (!overflow && all_ok) break;
@@ -341,18 +360,47 @@ private:
     }
 
     void accum_nets(const RoutePath& path, int nets, Design& d) const {
-        for (auto& seg : path.segments) {
-            if (seg.rect_name.size() >= 2 && seg.rect_name.substr(0,2) == "CH") {
-                for (auto& ch : d.channels) {
-                    if (ch.name == seg.rect_name) {
-                        // 判定跨越方向
-                        bool has_x = (seg.edge_in == 1 || seg.edge_in == 3 || seg.edge_out == 1 || seg.edge_out == 3);
-                        bool has_y = (seg.edge_in == 2 || seg.edge_in == 4 || seg.edge_out == 2 || seg.edge_out == 4);
-                        if (has_x) const_cast<Channel&>(ch).nets_x += nets;
-                        if (has_y) const_cast<Channel&>(ch).nets_y += nets;
-                        break;
-                    }
+        // Look up rect (block or channel) bounds by name.
+        auto rect_of = [&](const std::string& nm) -> std::array<double,4> {
+            for (auto& b : d.blocks)   if (b.name == nm) return {b.lx, b.ly, b.width,  b.height};
+            for (auto& c : d.channels) if (c.name == nm) return {c.lx, c.ly, c.width,  c.height};
+            return {0,0,0,0};
+        };
+        // Midpoint of overlap between two rects on the shared edge.
+        auto overlap_mid = [&](const std::array<double,4>& A, const std::array<double,4>& B) {
+            double ox0 = std::max(A[0], B[0]);
+            double ox1 = std::min(A[0]+A[2], B[0]+B[2]);
+            double oy0 = std::max(A[1], B[1]);
+            double oy1 = std::min(A[1]+A[3], B[1]+B[3]);
+            return std::pair<double,double>{(ox0+ox1)*0.5, (oy0+oy1)*0.5};
+        };
+        const auto& segs = path.segments;
+        for (int i = 0; i < (int)segs.size(); i++) {
+            const auto& seg = segs[i];
+            if (seg.rect_name.size() < 2 || seg.rect_name.substr(0,2) != "CH") continue;
+            for (auto& ch : d.channels) {
+                if (ch.name != seg.rect_name) continue;
+                bool has_x = (seg.edge_in == 1 || seg.edge_in == 3 || seg.edge_out == 1 || seg.edge_out == 3);
+                bool has_y = (seg.edge_in == 2 || seg.edge_in == 4 || seg.edge_out == 2 || seg.edge_out == 4);
+                // Z-shape inside channel: parallel-edge entry/exit at a
+                // different transverse coord uses BOTH axes' capacity
+                // (Fig 6).  Edge-only check misses this.
+                if (i > 0 && i + 1 < (int)segs.size()) {
+                    auto ch_rect = rect_of(seg.rect_name);
+                    auto prev_rect = rect_of(segs[i-1].rect_name);
+                    auto next_rect = rect_of(segs[i+1].rect_name);
+                    auto entry = overlap_mid(ch_rect, prev_rect);
+                    auto exit  = overlap_mid(ch_rect, next_rect);
+                    if ((seg.edge_in == 1 || seg.edge_in == 3) &&
+                        (seg.edge_out == 1 || seg.edge_out == 3) &&
+                        std::abs(entry.second - exit.second) > 1e-3) has_y = true;
+                    if ((seg.edge_in == 2 || seg.edge_in == 4) &&
+                        (seg.edge_out == 2 || seg.edge_out == 4) &&
+                        std::abs(entry.first - exit.first) > 1e-3) has_x = true;
                 }
+                if (has_x) const_cast<Channel&>(ch).nets_x += nets;
+                if (has_y) const_cast<Channel&>(ch).nets_y += nets;
+                break;
             }
         }
     }

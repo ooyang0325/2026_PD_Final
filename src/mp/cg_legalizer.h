@@ -32,6 +32,22 @@ class CGLegalizer {
 public:
     CGLegalizer(Floorplan& fp, Design& d) : fp_(fp), d_(d) {}
 
+    // Per-pair separation boost (multiplicative).  Default 1.0 = no boost.
+    // The route-driven outer feedback loop (main.cpp) bumps this for block
+    // pairs whose interstitial channel overflowed, so the next legalize pass
+    // pushes them farther apart along the right axis.  Two axes are tracked
+    // independently because a horizontal-channel overflow only needs more
+    // y-gap and vice versa.
+    std::vector<std::vector<double>> boost_x;  // boost_x[i][j], symmetric
+    std::vector<std::vector<double>> boost_y;
+
+    // External hook: set the per-pair boost map before calling legalize().
+    void set_boost(std::vector<std::vector<double>> bx,
+                   std::vector<std::vector<double>> by) {
+        boost_x = std::move(bx);
+        boost_y = std::move(by);
+    }
+
     // Returns true iff the committed layout is overlap-free AND in-bounds.
     bool legalize(double W, double H) {
         const int n = (int)d_.blocks.size();
@@ -108,6 +124,25 @@ public:
             }
         }
 
+        // Per-pair base SEP: 1 µm physical minimum + connection-demand bonus,
+        // capped at SEP_CAP.  A larger uniform halo floor (cfg::HALO*0.5
+        // = 15 µm) was tested but regressed case1 1P → 10P: it packed
+        // FT-source blocks away from their neighbors, so the FT growth loop
+        // couldn't expand them.  The connection-demand bonus already targets
+        // exactly the pairs whose channel needs to be wider, without forcing
+        // uniform whitespace.  Route-feedback boost handles outliers (× CAP=500).
+        const double SEP_CAP = 30.0;
+        base_sep_.assign(n, std::vector<double>(n, 1.0));
+        for (const auto& c : d_.connections) {
+            if (c.from < 0 || c.to < 0 || c.from >= n || c.to >= n) continue;
+            if (c.from == c.to) continue;
+            double extra = std::max(0.0, (double)c.nets / 25.0);
+            double sep   = std::min(SEP_CAP, 1.0 + extra * 0.5);
+            int a = c.from, b = c.to;
+            base_sep_[a][b] = std::max(base_sep_[a][b], sep);
+            base_sep_[b][a] = base_sep_[a][b];
+        }
+
         // Working coordinates seeded from the global placement, clamped/snapped.
         std::vector<double> x(n), y(n);
         for (int i = 0; i < n; i++) {
@@ -149,6 +184,20 @@ private:
     // block must merely overlap the band, not be contained.
     std::vector<double> bx_lo_, bx_hi_, by_lo_, by_hi_;
 
+    // Per-pair required minimum gap (µm).  Built each legalize() call from
+    // d_.connections — connection nets / 25 nets-per-µm → channel width.
+    std::vector<std::vector<double>> base_sep_;
+
+    // Effective per-pair, per-axis SEP, combining base_sep_ × external boost.
+    double sep_for(int i, int j, bool xaxis) const {
+        double s = base_sep_[i][j];
+        if (xaxis && (int)boost_x.size() > i && (int)boost_x[i].size() > j)
+            s *= boost_x[i][j];
+        if (!xaxis && (int)boost_y.size() > i && (int)boost_y[i].size() > j)
+            s *= boost_y[i][j];
+        return std::max(0.1, s);  // never collapse to zero
+    }
+
     static double clamp(double v, double lo, double hi) {
         if (hi < lo) hi = lo;                 // degenerate: block wider than slack
         return std::max(lo, std::min(hi, v));
@@ -170,16 +219,25 @@ private:
                      const std::vector<double>& fix_x, const std::vector<double>& fix_y,
                      double W, double H) {
         const int n = (int)x.size();
-        const double SEP = 0.1;               // hairline gap so 0.01 snap stays clear
         const int ROUNDS = 60;
         for (int r = 0; r < ROUNDS; r++) {
             bool any = false;
             for (int i = 0; i < n; i++) {
                 for (int j = i + 1; j < n; j++) {
-                    double ox = std::min(x[i] + fp_.W[i], x[j] + fp_.W[j])
-                              - std::max(x[i], x[j]);
-                    double oy = std::min(y[i] + fp_.H[i], y[j] + fp_.H[j])
-                              - std::max(y[i], y[j]);
+                    double ox_raw = std::min(x[i] + fp_.W[i], x[j] + fp_.W[j])
+                                  - std::max(x[i], x[j]);
+                    double oy_raw = std::min(y[i] + fp_.H[i], y[j] + fp_.H[j])
+                                  - std::max(y[i], y[j]);
+                    // Treat "insufficient SEP gap" as effective overlap: the
+                    // SEP-inflated rectangles must not overlap.  This is what
+                    // makes the route-feedback boost matrix actually move
+                    // blocks: when boost grows past the realised gap, the pair
+                    // is pushed farther apart even though they don't physically
+                    // overlap right now.
+                    double SEP_x = sep_for(i, j, /*xaxis=*/true);
+                    double SEP_y = sep_for(i, j, /*xaxis=*/false);
+                    double ox = ox_raw + SEP_x;
+                    double oy = oy_raw + SEP_y;
                     if (ox <= 1e-6 || oy <= 1e-6) continue;
                     any = true;
 
@@ -190,7 +248,7 @@ private:
                     if (!sep_x && pin_y[i] && pin_y[j]) sep_x = true;   // y blocked
 
                     if (sep_x) {
-                        double push = ox + SEP;
+                        double push = ox;   // = ox_raw + SEP_x
                         bool pi = pin_x[i], pj = pin_x[j];
                         double si = pi ? 0.0 : (pj ? 1.0 : 0.5);
                         double sj = pj ? 0.0 : (pi ? 1.0 : 0.5);
@@ -200,7 +258,7 @@ private:
                             x[i] += push * si; x[j] -= push * sj;
                         }
                     } else {
-                        double push = oy + SEP;
+                        double push = oy;   // = oy_raw + SEP_y
                         bool pi = pin_y[i], pj = pin_y[j];
                         double si = pi ? 0.0 : (pj ? 1.0 : 0.5);
                         double sj = pj ? 0.0 : (pi ? 1.0 : 0.5);
@@ -227,19 +285,23 @@ private:
                      const std::vector<double>& fix_x, const std::vector<double>& fix_y,
                      double W, double H, int sweeps) {
         const int n = (int)x.size();
-        const double SEP = 0.1;
         for (int it = 0; it < sweeps; it++) {
             bool any = false;
             for (int i = 0; i < n; i++) {
                 for (int j = i + 1; j < n; j++) {
-                    double ox = std::min(x[i] + fp_.W[i], x[j] + fp_.W[j])
-                              - std::max(x[i], x[j]);
-                    double oy = std::min(y[i] + fp_.H[i], y[j] + fp_.H[j])
-                              - std::max(y[i], y[j]);
+                    double ox_raw = std::min(x[i] + fp_.W[i], x[j] + fp_.W[j])
+                                  - std::max(x[i], x[j]);
+                    double oy_raw = std::min(y[i] + fp_.H[i], y[j] + fp_.H[j])
+                                  - std::max(y[i], y[j]);
+                    // SEP-aware overlap: enforce minimum gap as well as overlap-free.
+                    double SEP_x = sep_for(i, j, /*xaxis=*/true);
+                    double SEP_y = sep_for(i, j, /*xaxis=*/false);
+                    double ox = ox_raw + SEP_x;
+                    double oy = oy_raw + SEP_y;
                     if (ox <= 1e-6 || oy <= 1e-6) continue;
                     any = true;
 
-                    // Separate along the smaller overlap (MTV); honor pins.
+                    // Separate along the smaller deficit (MTV); honor pins.
                     bool sep_x = (ox < oy);
                     bool fully_pinned_x = pin_x[i] && pin_x[j];
                     bool fully_pinned_y = pin_y[i] && pin_y[j];
@@ -247,7 +309,7 @@ private:
                     if (!sep_x && fully_pinned_y && !fully_pinned_x) sep_x = true;
 
                     if (sep_x) {
-                        double push = ox + SEP;
+                        double push = ox;   // = ox_raw + SEP_x
                         bool pi = pin_x[i], pj = pin_x[j];
                         if (pi && pj) continue;          // cannot separate on x
                         double si = pi ? 0.0 : (pj ? 1.0 : 0.5);
@@ -258,7 +320,7 @@ private:
                             x[i] += push * si; x[j] -= push * sj;
                         }
                     } else {
-                        double push = oy + SEP;
+                        double push = oy;   // = oy_raw + SEP_y
                         bool pi = pin_y[i], pj = pin_y[j];
                         if (pi && pj) continue;          // cannot separate on y
                         double si = pi ? 0.0 : (pj ? 1.0 : 0.5);
